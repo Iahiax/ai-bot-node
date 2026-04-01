@@ -5,7 +5,6 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// ─── دعم ملف .env على Windows/Linux المحلي ───────────────────────────────────
 try {
   const envPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '.env');
   if (fs.existsSync(envPath)) {
@@ -22,7 +21,6 @@ const BOT_EMAIL  = 'scodoublet@yahoo.com';
 const BOT_PASS   = '12345';
 const DATA_FILE  = path.join(__dirname, 'players.json');
 
-// ─── Gemini ───────────────────────────────────────────────────────────────────
 const _geminiKey     = process.env.AI_INTEGRATIONS_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
 const _geminiBaseUrl = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
 const ai = new GoogleGenAI({
@@ -150,10 +148,8 @@ async function isVulgar(text) {
       `Answer YES if the following word/text is sexual, pornographic, adult-only, or vulgar. Answer NO otherwise.\nText: "${text.slice(0,120)}"\nAnswer (YES/NO only):`,
       5, 0
     );
-    console.log(`[VULGAR CHECK] "${text.slice(0,30)}" → "${r.trim()}"`);
     return /^YES/i.test(r.trim());
   } catch(e) {
-    console.warn('[VULGAR CHECK ERR]', e.message?.slice(0,40));
     return true;
   }
 }
@@ -171,10 +167,10 @@ function fastDetect(text) {
 
   if (/^[!！]معرفات\s*تلقائي/.test(tl)) return {cmd:'AUTO_GAME_GUESS',userLang:'Arabic'};
   if (/^[!！]معاني\s*تلقائي/.test(tl))  return {cmd:'AUTO_GAME_WORD',userLang:'Arabic'};
-  if (/^[!！]كلم[هة]\s*تلقائي/.test(tl))         return {cmd:'AUTO_GAME_TR_WORD',userLang:'Arabic'};
-  if (/^[!！]جمل[هة]\s*تلقائي/.test(tl))         return {cmd:'AUTO_GAME_TR_SENT',userLang:'Arabic'};
-  if (/^[!！]نص\s*تلقائي/.test(tl))               return {cmd:'AUTO_GAME_TR_TEXT',userLang:'Arabic'};
-  if (/^[!！](اعرب|إعراب)\s*تلقائي/.test(tl))    return {cmd:'AUTO_GAME_GRAMMAR',userLang:'Arabic'};
+  if (/^[!！]كلم[هة]\s*تلقائي/.test(tl))      return {cmd:'AUTO_GAME_TR_WORD',userLang:'Arabic'};
+  if (/^[!！]جمل[هة]\s*تلقائي/.test(tl))      return {cmd:'AUTO_GAME_TR_SENT',userLang:'Arabic'};
+  if (/^[!！]نص\s*تلقائي/.test(tl))            return {cmd:'AUTO_GAME_TR_TEXT',userLang:'Arabic'};
+  if (/^[!！](اعرب|إعراب)\s*تلقائي/.test(tl)) return {cmd:'AUTO_GAME_GRAMMAR',userLang:'Arabic'};
 
   if (/^[!！]معرفات\s*بدء$/.test(tl)) return {cmd:'GAME_GUESS',  userLang:'Arabic'};
   if (/^[!！]معاني\s*بدء/.test(tl))   return {cmd:'GAME_WORD',   userLang:'Arabic'};
@@ -292,11 +288,9 @@ For TR games: extract fromLang/toLang if mentioned.
 JSON only: {"cmd":"","userLang":"","fromLang":"","toLang":"","queryText":""}`,
       512, 0
     );
-    console.log(`[INTENT] "${text.slice(0,30)}" → ${r.cmd} [${r.userLang}]`);
     if (r.cmd === 'UNKNOWN') unknownCache.set(ck, Date.now());
     return r;
   } catch(e) {
-    console.error('[INTENT ERR]', e.message?.slice(0,60));
     unknownCache.set(ck, Date.now());
     return {cmd:'UNKNOWN',userLang:'Arabic',fromLang:'',toLang:'',queryText:''};
   }
@@ -316,7 +310,7 @@ The player was shown this DESCRIPTION/CLUE in ${ansLang}: "${game.display.slice(
 The player must GUESS THE WORD that matches this description.
 Correct word: "${game.answer}"
 Player's guess: "${playerMsg}"
-RULES: Accept the exact word, common spelling variations, or very close synonyms that match the description equally well.`;
+RULES: Accept the exact word, common spelling variations, or very close synonyms.`;
     } else if (game.type === 'GAME_WORD') {
       context =
 `GAME TYPE: Word meaning game
@@ -373,10 +367,8 @@ pct=XX pts=YY diff=سهل/متوسط/صعب ok=true/false feedback=ONE_SENTENCE_
     const diff   = raw.match(/diff=([^\s]+)/)?.[1]        || 'متوسط';
     const ok     = /ok=true/i.test(raw);
     const fb     = raw.match(/feedback=(.+)/)?.[1]?.trim() || '';
-    console.log(`[EVAL] type=${game.type} pct=${pct} pts=${pts} ok=${ok} max=${maxPts}`);
     return { correct: ok || pct>=40, pct, pts, difficulty:2, diffLabel:diff, feedback:fb };
   } catch(e) {
-    console.error('[EVAL ERR]', e.message?.slice(0,80));
     return { correct:false, pct:0, pts:0, difficulty:1, diffLabel:'', feedback:'' };
   }
 }
@@ -655,13 +647,9 @@ client.on('channelMessage', async (msg) => {
   if (!hasGame && !isCmd) return;
   if (hasGame && !isCmd && !isAns) return;
 
-  let name = String(uid);
-  try { const s = await client.subscriber.getById(uid); if(s?.nickname) name=s.nickname; } catch(e){}
-  getPlayer(uid, name, cid);
-  db = loadDB();
-
   const {send,alert} = io(cid);
 
+  // ─── تقييم الإجابة (رسائل تبدأ بـ # في قناة فيها لعبة) ─────────────────
   if (hasGame && isAns) {
     const key = `${cid}_${uid}`;
     if (lastAns[key] && Date.now()-lastAns[key]<3000) return;
@@ -676,6 +664,10 @@ client.on('channelMessage', async (msg) => {
       const ev = await evalAnswer(games[cid], answerText);
       const diff = ev.diffLabel ? ` | ${ev.diffLabel}` : '';
       if (ev.correct || ev.pct>=30) {
+        // ─── تسجيل اللاعب فقط عند الحصول على نقاط ───────────────────────
+        let name = String(uid);
+        try { const s = await client.subscriber.getById(uid); if(s?.nickname) name=s.nickname; } catch(e){}
+        getPlayer(uid, name, cid);
         addPts(uid, ev.pts||3, cid);
         db = loadDB();
         const total = db.players[String(uid)]?.pts||0;
@@ -704,7 +696,8 @@ client.on('channelMessage', async (msg) => {
 
   if (cmd==='MY_SCORE') {
     const p = db.players[String(uid)];
-    await send(`🏆 ${name}: ${p?.pts||0} نقطة`);
+    const displayName = p?.name || String(uid);
+    await send(`🏆 ${displayName}: ${p?.pts||0} نقطة`);
     return;
   }
 
