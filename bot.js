@@ -1,4 +1,3 @@
-import { GoogleGenAI } from '@google/genai';
 import { WOLF } from 'wolf.js';
 import fs from 'fs';
 import http from 'http';
@@ -8,204 +7,71 @@ import { fileURLToPath } from 'url';
 // ╔══════════════════════════════════════════════════════════╗
 // ║           ⚙️  إعدادات البوت — عدّل هذا القسم            ║
 // ╚══════════════════════════════════════════════════════════╝
-const BOT_EMAIL        = 'scodoublet@yahoo.com';  // إيميل الحساب
-const BOT_PASS         = '12345';                  // كلمة المرور
-// مفاتيح Gemini — أضف حتى 5 مفاتيح من حسابات Google مختلفة
-// عند انتهاء حصة أحدها ينتقل البوت تلقائياً للمفتاح التالي
-// احصل على مفاتيح مجانية من: https://aistudio.google.com/apikey
-const GEMINI_KEYS_VPS = [
-  'AIzaSyBpZuXjoeyJthpSxd94X5DpekIUyjRck1k',  // المفتاح 1
-  'AIzaSyCS_WBaaRpIDJaeuxEgpOhzA513FQbkxSk',  // المفتاح 2
-  'AIzaSyDaySrfpSPkQ7_jivlK1dQStJfIlZLifEA',  // المفتاح 3
-  'AIzaSyA_zBovMEEn40Th1g6WkSRDG08omJ3olT0',  // المفتاح 4
-  'AIzaSyD-WJcT7JM1juR1Lsf5Nlj8tDSqGTszPu0',  // المفتاح 5
-  'AIzaSyBZwbEQIHNAjFnXJiT4l1J4CUR0-b43rtk',  // المفتاح 6
-  'AIzaSyAq6UXXTKfWXk5LBoPeOjLdoGET7iR_RpA',  // المفتاح 7
-  'AIzaSyBfsBLetUtLk4wepMjuhQyCZUGs2ABYpEA',   // المفتاح 8
-  'AIzaSyCuB9_OcSJgnL2soWYuPmY0rVIBl1Bw2KY',  // المفتاح 9
-  'AIzaSyAtdTunaYFOKr_kma3Vl7RG-8per7eB5dQ',  // المفتاح 10
-];
-const GEMINI_MODEL_VPS = 'gemini-2.0-flash';       // النموذج على VPS
-// مفاتيح Groq المجانية — بديل تلقائي عند انتهاء Gemini (14,400 طلب/يوم لكل مفتاح)
-// احصل على مفاتيح مجانية من: https://console.groq.com → API Keys
-const GROQ_KEYS_VPS = [
-  // 'ضع_مفتاح_groq_الأول',   // احذف // لتفعيله
-  // 'ضع_مفتاح_groq_الثاني',
-  // 'ضع_مفتاح_groq_الثالث',
+const BOT_EMAIL = 'scodoublet@yahoo.com'; // إيميل الحساب
+const BOT_PASS  = '12345';                // كلمة المرور
+// مفاتيح Groq المجانية — احصل عليها من: https://console.groq.com/keys
+// كل مفتاح = 14,400 طلب/يوم مجاناً | أضف أكثر من مفتاح للتبديل التلقائي
+const GROQ_KEYS = [
+  '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',  // المفتاح 1
+  // 'gsk_xxxxxxxxxxxxxxxxxxxxxx',  // المفتاح 2 — احذف // لتفعيله
+  // 'gsk_xxxxxxxxxxxxxxxxxxxxxx',  // المفتاح 3
 ];
 // ═══════════════════════════════════════════════════════════
 
-const __dirname  = path.dirname(fileURLToPath(import.meta.url));
-const DATA_FILE  = path.join(__dirname, 'players.json');
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_FILE = path.join(__dirname, 'players.json');
 
-// ─── Gemini — على Replit يستخدم المتغيرات التلقائية، على VPS يستخدم القيم أعلاه ───
-const _geminiBaseUrl = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
-const _isReplit      = !!_geminiBaseUrl;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── نظام تدوير المفاتيح ─────────────────────────────────────────────────────
-// على Replit: مفتاح واحد من المتغيرات البيئية
-// على VPS: قائمة المفاتيح مع تبديل تلقائي عند انتهاء الحصة
-const _replitKey = process.env.AI_INTEGRATIONS_GEMINI_API_KEY
-               || process.env.GEMINI_API_KEY
-               || process.env.GOOGLE_API_KEY;
+// ─── Groq AI ──────────────────────────────────────────────────────────────────
+const GROQ_MODEL    = 'llama-3.3-70b-versatile';
+const _groqKeys     = GROQ_KEYS.filter(k => k && k.startsWith('gsk_'));
+const _groqDead     = new Set(); // مفاتيح انتهت حصتها اليوم
+let   _lastCall     = 0;
+const CALL_GAP_MS   = 2000; // ثانيتان بين الطلبات
 
-// تصفية المفاتيح الحقيقية فقط (غير فارغة وغير placeholder)
-const _vpsKeys = GEMINI_KEYS_VPS.filter(k => k && !k.includes('ضع_مفتاح'));
-let _keyIndex  = 0; // المفتاح النشط حالياً
+console.log(`[AI] Groq | نموذج: ${GROQ_MODEL} | مفاتيح: ${_groqKeys.length}`);
 
-function currentKey() {
-  if (_isReplit) return _replitKey;
-  if (_vpsKeys.length === 0) return 'NO_KEY';
-  return _vpsKeys[_keyIndex % _vpsKeys.length];
-}
+async function gemini(prompt, maxTokens = 1024, temp = 0.7) {
+  // فاصل زمني بين الطلبات لتجنب تجاوز المعدل
+  const gap = CALL_GAP_MS - (Date.now() - _lastCall);
+  if (gap > 0) await sleep(gap);
+  _lastCall = Date.now();
 
-function nextKey() {
-  _keyIndex++;
-  const idx = _keyIndex % _vpsKeys.length;
-  console.warn(`[KEY ROTATE] → مفتاح #${idx + 1} من ${_vpsKeys.length}`);
-  return _vpsKeys[idx];
-}
+  const available = _groqKeys.filter(k => !_groqDead.has(k));
+  if (available.length === 0)
+    throw new Error('⏳ انتهت حصة جميع مفاتيح Groq اليوم.\nستتجدد في منتصف الليل (UTC).\nأضف مفاتيح جديدة من: console.groq.com/keys');
 
-// بناء كائن GoogleGenAI من مفتاح معين
-function buildAI(key) {
-  return new GoogleGenAI({
-    apiKey: key,
-    ..._geminiBaseUrl ? { httpOptions: { apiVersion: '', baseUrl: _geminiBaseUrl } } : {},
-  });
-}
-
-let ai = buildAI(currentKey());
-
-const GEMINI_MODEL = process.env.GEMINI_MODEL
-                  || (_isReplit ? 'gemini-2.5-flash' : GEMINI_MODEL_VPS);
-console.log(`[AI] نموذج Gemini: ${GEMINI_MODEL} | Replit=${_isReplit} | مفاتيح VPS=${_vpsKeys.length}`);
-
-// ─── Groq — بديل مجاني تلقائي عند انتهاء Gemini ────────────────────────────
-const _groqKeys        = GROQ_KEYS_VPS.filter(k => k && !k.includes('ضع_مفتاح'));
-const _groqExhausted   = new Set();
-let   _groqKeyIndex    = 0;
-let   _useGroq         = false; // يتفعّل تلقائياً عند انتهاء كل مفاتيح Gemini
-const GROQ_MODEL       = 'llama-3.3-70b-versatile'; // أقوى نموذج مجاني في Groq
-
-async function callGroq(prompt, maxTokens = 1024, temp = 0.7) {
-  const available = _groqKeys.filter(k => !_groqExhausted.has(k));
-  if (available.length === 0) throw new Error('⏳ انتهت حصة Groq أيضاً. ستتجدد في منتصف الليل (UTC).');
   for (const key of available) {
     try {
       const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
+        method : 'POST',
         headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: GROQ_MODEL,
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: maxTokens,
+        body   : JSON.stringify({
+          model      : GROQ_MODEL,
+          messages   : [{ role: 'user', content: prompt }],
+          max_tokens : maxTokens,
           temperature: temp,
         }),
         signal: AbortSignal.timeout(30000),
       });
       const data = await res.json();
       if (!res.ok) {
-        const errMsg = data?.error?.message || JSON.stringify(data);
         if (res.status === 429) {
-          console.warn(`[GROQ] حصة منتهية، جربّ المفتاح التالي`);
-          _groqExhausted.add(key);
+          console.warn(`[GROQ] مفتاح منتهٍ (429) → التالي`);
+          _groqDead.add(key);
           continue;
         }
-        throw new Error(`Groq ${res.status}: ${errMsg}`);
+        throw new Error(`Groq ${res.status}: ${data?.error?.message || JSON.stringify(data)}`);
       }
       return (data.choices?.[0]?.message?.content || '').trim();
     } catch(e) {
-      if (e.message.includes('429') || _groqExhausted.has(key)) { _groqExhausted.add(key); continue; }
+      if (e.message?.includes('429')) { _groqDead.add(key); continue; }
+      console.error('[GROQ ERR]', e.message?.slice(0, 100));
       throw e;
     }
   }
-  throw new Error('⏳ انتهت حصة جميع مفاتيح Groq اليوم. ستتجدد في منتصف الليل.');
-}
-
-console.log(`[AI] Groq مفاتيح: ${_groqKeys.length} | ${_groqKeys.length > 0 ? 'جاهز كبديل تلقائي' : 'غير مفعّل'}`);
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ─── تحكم في معدل الطلبات — منع تجاوز الحصة ─────────────────────────────────
-let _lastCall = 0;
-let _activeCall = false;
-// على VPS: زيادة الفاصل الزمني لتجنب تجاوز حصة الـ API (4 ثوانٍ بدلاً من 1.2)
-const CALL_GAP_MS = _isReplit ? 1200 : 4000;
-
-// إعداد الـ config المناسب لكل بيئة
-function buildConfig(maxTokens, temp) {
-  const base = { maxOutputTokens: maxTokens, temperature: temp };
-  // thinkingConfig متاح فقط على Replit (بروكسي خاص) — على VPS يسبب خطأ 400
-  if (_isReplit) base.thinkingConfig = { thinkingBudget: 0 };
-  return base;
-}
-
-// مجموعة المفاتيح المنتهية حصتها اليوم (تُصفّى تلقائياً)
-const _exhaustedKeys = new Set();
-
-async function gemini(prompt, maxTokens = 4096, temp = 0.7) {
-  // إذا انتهت كل مفاتيح Gemini → اذهب مباشرة لـ Groq
-  if (_useGroq && _groqKeys.length > 0) return callGroq(prompt, maxTokens, temp);
-  while (_activeCall) await sleep(200);
-  const gap = CALL_GAP_MS - (Date.now() - _lastCall);
-  if (gap > 0) await sleep(gap);
-  _activeCall = true;
-  _lastCall = Date.now();
-  try {
-    const r = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: buildConfig(maxTokens, temp),
-    });
-    return (r.text || '').trim();
-  } catch (e) {
-    const msg = e.message || String(e);
-    if (msg.includes('429')) {
-      const isQuota = msg.includes('quota') || msg.includes('QUOTA') || msg.includes('billing');
-      if (isQuota && !_isReplit && _vpsKeys.length > 1) {
-        // ─── تدوير المفاتيح: جرّب كل المفاتيح المتبقية ──────────────────
-        _exhaustedKeys.add(currentKey());
-        const available = _vpsKeys.filter(k => !_exhaustedKeys.has(k));
-        console.warn(`[KEY ROTATE] حصة منتهية | متبقٍ: ${available.length} مفتاح`);
-        for (const key of available) {
-          try {
-            _keyIndex = _vpsKeys.indexOf(key);
-            ai = buildAI(key);
-            console.warn(`[KEY ROTATE] جربّ مفتاح #${_keyIndex+1}`);
-            const r2 = await ai.models.generateContent({
-              model: GEMINI_MODEL,
-              contents: [{ role: 'user', parts: [{ text: prompt }] }],
-              config: buildConfig(maxTokens, temp),
-            });
-            return (r2.text || '').trim();
-          } catch(e2) {
-            const m2 = e2.message || String(e2);
-            if (m2.includes('429') && (m2.includes('quota') || m2.includes('billing'))) {
-              _exhaustedKeys.add(key);
-              console.warn(`[KEY ROTATE] مفتاح #${_keyIndex+1} منتهٍ أيضاً`);
-              continue;
-            }
-            throw e2; // خطأ مختلف — أعِد الرمي
-          }
-        }
-        // جميع مفاتيح Gemini منتهية — جرّب Groq إن كان مفعّلاً
-        console.error('[QUOTA] جميع مفاتيح Gemini انتهت!');
-        if (_groqKeys.length > 0) {
-          console.warn('[FALLBACK] التحويل إلى Groq...');
-          _useGroq = true;
-          return callGroq(prompt, maxTokens, temp);
-        }
-        throw new Error('⏳ انتهت حصة جميع مفاتيح Gemini اليوم.\nستتجدد في منتصف الليل (UTC).\n💡 أضف مفاتيح Groq المجانية من: console.groq.com');
-      }
-      if (isQuota) {
-        console.error('[QUOTA] انتهت الحصة اليومية للمفتاح!');
-        throw new Error('⏳ انتهت حصة مفتاح API اليومية المجانية.\nستتجدد في منتصف الليل (UTC).\n💡 أضف مفاتيح إضافية في GEMINI_KEYS_VPS للتبديل التلقائي.');
-      }
-      // تجاوز معدل مؤقت — انتظر وأعد المحاولة مرة واحدة
-      console.warn('[RATE LIMIT] انتظار 20 ثانية...');
-      await sleep(20000);
-      const r2 = await ai.models.generateContent({
-        model: GEMINI_MODEL,
+  throw new Error('⏳ انتهت حصة جميع مفاتيح Groq اليوم. ستتجدد في منتصف الليل.');       model: GEMINI_MODEL,
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         config: buildConfig(maxTokens, temp),
       });
@@ -793,23 +659,7 @@ async function startGame(cid, type, lang, fromLang, toLang) {
   await send('⏳...');
   let q;
   let lastErr = '';
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const pre = pregenQ[cid];
-      if (attempt === 1 && pre?.type===type) { q=pre; delete pregenQ[cid]; break; }
-      q = await makeQ(type, lang, fromLang, toLang);
-      break;
-    } catch(e) {
-      lastErr = e.message || String(e);
-      console.error(`[MAKEQ ERR attempt=${attempt}]`, type, lastErr.slice(0,120));
-      if (attempt === 3) {
-        // إظهار سبب الخطأ الحقيقي لتسهيل التشخيص
-        const reason = lastErr.includes('API_KEY') ? '🔑 مفتاح API خاطئ أو مفقود'
-          : lastErr.includes('429') || lastErr.includes('RATE') ? '⏱ تجاوز حصة API — انتظر قليلاً'
-          : lastErr.includes('not found') || lastErr.includes('404') ? '🤖 النموذج غير متاح: '+GEMINI_MODEL
-          : lastErr.includes('400') ? '❌ خطأ 400 — تحقق من إعدادات API'
-          : lastErr.slice(0,60);
-        await alert(`⚠️ فشل توليد السؤال:\n${reason}`);
+  for (let attempt = 1; attempt await alert('⚠️ تعذّر توليد السؤال، حاول لاحقاً.');
         return;
       }
       await sleep(2000);
@@ -874,8 +724,7 @@ const HELP_TEXT =
 🏆 !لغه مجموع
 📊 !لغه ترتيب قناه
 🌍 !لغه ترتيب ولف
-📋 !لغه مساعده
-🔧 !لغه اختبار`;
+📋 !لغه مساعده`;
 
 // ─── Wolf Bot ─────────────────────────────────────────────────────────────────
 const client = new WOLF();
@@ -973,44 +822,6 @@ client.on('channelMessage', async (msg) => {
 
   // ─── تنفيذ الأوامر ──────────────────────────────────────────────────────
 
-  if (cmd==='DIAG') {
-    // ── 1) معلومات البيئة ──
-    const keySource = process.env.AI_INTEGRATIONS_GEMINI_API_KEY ? 'AI_INTEGRATIONS (Replit)'
-      : process.env.GEMINI_API_KEY   ? 'GEMINI_API_KEY'
-      : process.env.GOOGLE_API_KEY   ? 'GOOGLE_API_KEY'
-      : '❌ لا يوجد مفتاح!';
-    const keyOk = !!_geminiKey;
-    await send(
-      `🔧 تشخيص البوت:\n` +
-      `• Replit = ${_isReplit}\n` +
-      `• نموذج = ${GEMINI_MODEL}\n` +
-      `• مصدر المفتاح = ${keySource}\n` +
-      `• المفتاح موجود = ${keyOk ? '✅' : '❌'}\n` +
-      `• جاري الاختبار...`
-    );
-    if (!keyOk) {
-      await alert('❌ لا يوجد مفتاح API!\nأضف GOOGLE_API_KEY في ملف .env');
-      return;
-    }
-    // ── 2) اختبار مباشر يتجاوز الـ wrapper ──
-    try {
-      const t0 = Date.now();
-      const r = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: [{ role:'user', parts:[{ text:'Reply OK' }] }],
-        config: { maxOutputTokens: 5, temperature: 0 },
-      });
-      const ms  = Date.now() - t0;
-      const txt = (r.text||'').trim().slice(0,20);
-      await send(`✅ Gemini يعمل! (${ms}ms)\nرد: "${txt}"\nنموذج: ${GEMINI_MODEL}`);
-    } catch(e) {
-      // إظهار الخطأ كاملاً بدون تقطيع
-      const fullMsg = (e.message || String(e)).slice(0, 400);
-      await alert(`❌ خطأ Gemini الكامل:\n${fullMsg}`);
-    }
-    return;
-  }
-
   if (cmd==='HELP') { await send(HELP_TEXT); return; }
 
   if (cmd==='MY_SCORE') {
@@ -1065,6 +876,52 @@ client.on('channelMessage', async (msg) => {
     if (curAuto?.active && curAuto.type !== newType) {
       const curLabel = LABEL[curAuto.type] || curAuto.type;
       await send(`⚠️ يوجد وضع تلقائي نشط: ${curLabel}\nأوقفه أولاً بنفس الأمر قبل بدء نوع آخر.`);
+      return;
+    }
+    await toggleAuto(cid, newType, lang, fl, tl);
+    return;
+  }
+
+  // بدء الألعاب
+  const GAME_CMDS = ['GAME_GUESS','GAME_WORD','GAME_TR_WORD','GAME_TR_SENT','GAME_TR_TEXT','GAME_GRAMMAR'];
+  if (GAME_CMDS.includes(cmd)) {
+    // منع التداخل فقط إذا كان الوضع التلقائي نشطاً
+    if (autoSt[cid]?.active) {
+      const curLabel = LABEL[autoSt[cid].type] || autoSt[cid].type;
+      await send(`⚠️ الوضع التلقائي نشط: ${curLabel}\nأوقفه أولاً قبل بدء لعبة يدوية.`);
+      return;
+    }
+    // إذا كان الوضع التلقائي متوقفاً أو لا توجد لعبة → ابدأ مباشرة
+    await startGame(cid, cmd, lang, fl, tl);
+    return;
+  }
+
+  if (cmd==='MEANING') {
+    const q = queryText||text.replace(/^[!！]\S+\s*/,'').trim();
+    if (!q) return;
+    if (isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
+    await send('⏳...');
+    try {
+      const ans = await gemini(`Define "${q}" in ${lang}. Reply in ONE sentence only, max 15 words. No labels, no extra text.`, 80, 0.3);
+      await send(`📚 ${ans}`);
+    } catch(e) {
+      console.error('[MEANING ERR]', (e.message||'').slice(0,100));
+      await alert('⚠️ تعذّر الآن، حاول لاحقاً.');
+    }
+    return;
+  }
+
+  if (cmd==='TRANSLATE') {
+    const q = queryText||text.replace(/^[!！]\S+\s*/,'').trim();
+    if (!q) return;
+    if (isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
+    await send('⏳...');
+    try {
+      const ans = await gemini(`Translate to ${tl}. Return ONLY the translation:\n${q}`, 300, 0.3);
+      await send(`🌐 ${ans}`);
+    } catch(e) {
+      console.error('[TRANSLATE ERR]', (e.message||'').slice(0,100));
+      await alert('⚠️ تعذّر الآن، حاول لاحقاً.'end(`⚠️ يوجد وضع تلقائي نشط: ${curLabel}\nأوقفه أولاً بنفس الأمر قبل بدء نوع آخر.`);
       return;
     }
     await toggleAuto(cid, newType, lang, fl, tl);
