@@ -110,22 +110,30 @@ async function gemini(prompt, maxTokens = 4096, temp = 0.7) {
     if (msg.includes('429')) {
       const isQuota = msg.includes('quota') || msg.includes('QUOTA') || msg.includes('billing');
       if (isQuota && !_isReplit && _vpsKeys.length > 1) {
-        // ─── تدوير المفاتيح: انتقل للمفتاح التالي ───────────────────────
-        const usedKey = currentKey();
-        _exhaustedKeys.add(usedKey);
-        // ابحث عن مفتاح غير منتهٍ
+        // ─── تدوير المفاتيح: جرّب كل المفاتيح المتبقية ──────────────────
+        _exhaustedKeys.add(currentKey());
         const available = _vpsKeys.filter(k => !_exhaustedKeys.has(k));
-        if (available.length > 0) {
-          _keyIndex = _vpsKeys.indexOf(available[0]);
-          ai = buildAI(currentKey());
-          console.warn(`[KEY ROTATE] مفتاح #${_keyIndex+1} منتهٍ → تبديل تلقائي | متبقٍ: ${available.length-1} مفتاح`);
-          // إعادة المحاولة بالمفتاح الجديد
-          const r2 = await ai.models.generateContent({
-            model: GEMINI_MODEL,
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            config: buildConfig(maxTokens, temp),
-          });
-          return (r2.text || '').trim();
+        console.warn(`[KEY ROTATE] حصة منتهية | متبقٍ: ${available.length} مفتاح`);
+        for (const key of available) {
+          try {
+            _keyIndex = _vpsKeys.indexOf(key);
+            ai = buildAI(key);
+            console.warn(`[KEY ROTATE] جربّ مفتاح #${_keyIndex+1}`);
+            const r2 = await ai.models.generateContent({
+              model: GEMINI_MODEL,
+              contents: [{ role: 'user', parts: [{ text: prompt }] }],
+              config: buildConfig(maxTokens, temp),
+            });
+            return (r2.text || '').trim();
+          } catch(e2) {
+            const m2 = e2.message || String(e2);
+            if (m2.includes('429') && (m2.includes('quota') || m2.includes('billing'))) {
+              _exhaustedKeys.add(key);
+              console.warn(`[KEY ROTATE] مفتاح #${_keyIndex+1} منتهٍ أيضاً`);
+              continue;
+            }
+            throw e2; // خطأ مختلف — أعِد الرمي
+          }
         }
         // جميع المفاتيح منتهية
         console.error('[QUOTA] جميع المفاتيح انتهت حصتها اليومية!');
