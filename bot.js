@@ -26,6 +26,13 @@ const GEMINI_KEYS_VPS = [
   'AIzaSyAtdTunaYFOKr_kma3Vl7RG-8per7eB5dQ',  // المفتاح 10
 ];
 const GEMINI_MODEL_VPS = 'gemini-2.0-flash';       // النموذج على VPS
+// مفاتيح Groq المجانية — بديل تلقائي عند انتهاء Gemini (14,400 طلب/يوم لكل مفتاح)
+// احصل على مفاتيح مجانية من: https://console.groq.com → API Keys
+const GROQ_KEYS_VPS = [
+  // 'ضع_مفتاح_groq_الأول',   // احذف // لتفعيله
+  // 'ضع_مفتاح_groq_الثاني',
+  // 'ضع_مفتاح_groq_الثالث',
+];
 // ═══════════════════════════════════════════════════════════
 
 const __dirname  = path.dirname(fileURLToPath(import.meta.url));
@@ -73,6 +80,50 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL
                   || (_isReplit ? 'gemini-2.5-flash' : GEMINI_MODEL_VPS);
 console.log(`[AI] نموذج Gemini: ${GEMINI_MODEL} | Replit=${_isReplit} | مفاتيح VPS=${_vpsKeys.length}`);
 
+// ─── Groq — بديل مجاني تلقائي عند انتهاء Gemini ────────────────────────────
+const _groqKeys        = GROQ_KEYS_VPS.filter(k => k && !k.includes('ضع_مفتاح'));
+const _groqExhausted   = new Set();
+let   _groqKeyIndex    = 0;
+let   _useGroq         = false; // يتفعّل تلقائياً عند انتهاء كل مفاتيح Gemini
+const GROQ_MODEL       = 'llama-3.3-70b-versatile'; // أقوى نموذج مجاني في Groq
+
+async function callGroq(prompt, maxTokens = 1024, temp = 0.7) {
+  const available = _groqKeys.filter(k => !_groqExhausted.has(k));
+  if (available.length === 0) throw new Error('⏳ انتهت حصة Groq أيضاً. ستتجدد في منتصف الليل (UTC).');
+  for (const key of available) {
+    try {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: GROQ_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: maxTokens,
+          temperature: temp,
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const errMsg = data?.error?.message || JSON.stringify(data);
+        if (res.status === 429) {
+          console.warn(`[GROQ] حصة منتهية، جربّ المفتاح التالي`);
+          _groqExhausted.add(key);
+          continue;
+        }
+        throw new Error(`Groq ${res.status}: ${errMsg}`);
+      }
+      return (data.choices?.[0]?.message?.content || '').trim();
+    } catch(e) {
+      if (e.message.includes('429') || _groqExhausted.has(key)) { _groqExhausted.add(key); continue; }
+      throw e;
+    }
+  }
+  throw new Error('⏳ انتهت حصة جميع مفاتيح Groq اليوم. ستتجدد في منتصف الليل.');
+}
+
+console.log(`[AI] Groq مفاتيح: ${_groqKeys.length} | ${_groqKeys.length > 0 ? 'جاهز كبديل تلقائي' : 'غير مفعّل'}`);
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ─── تحكم في معدل الطلبات — منع تجاوز الحصة ─────────────────────────────────
@@ -93,6 +144,8 @@ function buildConfig(maxTokens, temp) {
 const _exhaustedKeys = new Set();
 
 async function gemini(prompt, maxTokens = 4096, temp = 0.7) {
+  // إذا انتهت كل مفاتيح Gemini → اذهب مباشرة لـ Groq
+  if (_useGroq && _groqKeys.length > 0) return callGroq(prompt, maxTokens, temp);
   while (_activeCall) await sleep(200);
   const gap = CALL_GAP_MS - (Date.now() - _lastCall);
   if (gap > 0) await sleep(gap);
@@ -135,9 +188,14 @@ async function gemini(prompt, maxTokens = 4096, temp = 0.7) {
             throw e2; // خطأ مختلف — أعِد الرمي
           }
         }
-        // جميع المفاتيح منتهية
-        console.error('[QUOTA] جميع المفاتيح انتهت حصتها اليومية!');
-        throw new Error('⏳ انتهت حصة جميع مفاتيح API اليوم.\nستتجدد تلقائياً في منتصف الليل (UTC).');
+        // جميع مفاتيح Gemini منتهية — جرّب Groq إن كان مفعّلاً
+        console.error('[QUOTA] جميع مفاتيح Gemini انتهت!');
+        if (_groqKeys.length > 0) {
+          console.warn('[FALLBACK] التحويل إلى Groq...');
+          _useGroq = true;
+          return callGroq(prompt, maxTokens, temp);
+        }
+        throw new Error('⏳ انتهت حصة جميع مفاتيح Gemini اليوم.\nستتجدد في منتصف الليل (UTC).\n💡 أضف مفاتيح Groq المجانية من: console.groq.com');
       }
       if (isQuota) {
         console.error('[QUOTA] انتهت الحصة اليومية للمفتاح!');
