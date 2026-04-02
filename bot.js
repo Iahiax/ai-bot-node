@@ -23,6 +23,9 @@ const DATA_FILE  = path.join(__dirname, 'players.json');
 
 const _geminiKey     = process.env.AI_INTEGRATIONS_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
 const _geminiBaseUrl = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
+const _isReplit      = !!process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
+const GEMINI_MODEL   = process.env.GEMINI_MODEL || (_isReplit ? 'gemini-2.5-flash' : 'gemini-1.5-flash');
+console.log(`[AI] نموذج Gemini: ${GEMINI_MODEL} | Replit=${_isReplit}`);
 const ai = new GoogleGenAI({
   apiKey: _geminiKey,
   ..._geminiBaseUrl ? { httpOptions: { apiVersion: '', baseUrl: _geminiBaseUrl } } : {},
@@ -32,7 +35,13 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 let _lastCall = 0;
 let _activeCall = false;
-const CALL_GAP_MS = 1200;
+const CALL_GAP_MS = _isReplit ? 1200 : 4000;
+
+function buildConfig(maxTokens, temp) {
+  const base = { maxOutputTokens: maxTokens, temperature: temp };
+  if (_isReplit) base.thinkingConfig = { thinkingBudget: 0 };
+  return base;
+}
 
 async function gemini(prompt, maxTokens = 4096, temp = 0.7) {
   while (_activeCall) await sleep(200);
@@ -42,28 +51,24 @@ async function gemini(prompt, maxTokens = 4096, temp = 0.7) {
   _lastCall = Date.now();
   try {
     const r = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: GEMINI_MODEL,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: {
-        maxOutputTokens: maxTokens,
-        temperature: temp,
-        thinkingConfig: { thinkingBudget: 0 },
-      },
+      config: buildConfig(maxTokens, temp),
     });
     return (r.text || '').trim();
   } catch (e) {
     const msg = e.message || '';
     if (msg.includes('RATELIMIT') || msg.includes('429')) {
-      console.warn('[RATE LIMIT] انتظار 15 ثانية...');
-      await sleep(15000);
+      console.warn('[RATE LIMIT] انتظار 20 ثانية...');
+      await sleep(20000);
       const r2 = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: GEMINI_MODEL,
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: { maxOutputTokens: maxTokens, temperature: temp, thinkingConfig: { thinkingBudget: 0 } },
+        config: buildConfig(maxTokens, temp),
       });
       return (r2.text || '').trim();
     }
-    console.error('[AI ERR]', msg.slice(0, 80));
+    console.error('[AI ERR]', msg.slice(0, 120));
     throw e;
   } finally {
     _activeCall = false;
@@ -87,7 +92,6 @@ async function geminiJSON(prompt, maxTokens = 512, temp = 0) {
   }
 }
 
-// ─── قاعدة البيانات ───────────────────────────────────────────────────────────
 function loadDB() {
   try { if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE,'utf8')); }
   catch(e) {}
@@ -137,14 +141,9 @@ const pregenQ  = {};
 const busy     = {};
 const lastAns  = {};
 
-// ─── فلتر المحتوى الإباحي ─────────────────────────────────────────────────────
 const VULGAR_RE = /زب|كس|طيز|شرم|عاهر|ق[حض]ب[هة]|منيو[كك]|متناك|ينيك|بتناك|نيك|شراميط|عرص|لوطي|خول|فاجر[هة]?|داعر[هة]?|فاحش[هة]?|porn|sex(?:ual|y)?|fuck|shit|bitch|cock|pussy|ass(?:hole)?|dick|nude|naked|xxx/i;
+function isVulgar(text) { return VULGAR_RE.test(text); }
 
-function isVulgar(text) {
-  return VULGAR_RE.test(text);
-}
-
-// ─── الكشف السريع عن الأوامر ─────────────────────────────────────────────────
 function fastDetect(text) {
   const t = text.trim();
   const tl = t.toLowerCase().replace(/\s+/g,' ');
@@ -157,6 +156,27 @@ function fastDetect(text) {
 
   if (/^[!！]معرفات\s*تلقائي/.test(tl)) return {cmd:'AUTO_GAME_GUESS',userLang:'Arabic'};
   if (/^[!！]معاني\s*تلقائي/.test(tl))  return {cmd:'AUTO_GAME_WORD',userLang:'Arabic'};
+
+  {
+    const LM = {
+      'عربي':'Arabic','عربية':'Arabic',
+      'انجليزي':'English','انجليزية':'English','انكليزي':'English','إنجليزي':'English',
+      'فرنسي':'French','فرنسية':'French','تركي':'Turkish','تركية':'Turkish',
+      'الماني':'German','المانية':'German','ألماني':'German',
+      'اسباني':'Spanish','اسبانية':'Spanish','إسباني':'Spanish',
+      'ايطالي':'Italian','ايطالية':'Italian','إيطالي':'Italian',
+      'فارسي':'Persian','فارسية':'Persian','اردو':'Urdu','أردو':'Urdu',
+      'هندي':'Hindi','صيني':'Chinese','روسي':'Russian',
+      'ياباني':'Japanese','كوري':'Korean','برتغالي':'Portuguese','هولندي':'Dutch',
+    };
+    const mAW = t.match(/^[!！]كلم[هة]\s+(\S+)\s+(\S+)\s*تلقائي/i);
+    if (mAW) return {cmd:'AUTO_GAME_TR_WORD',userLang:'Arabic',fromLang:LM[mAW[1]]||mAW[1],toLang:LM[mAW[2]]||mAW[2]};
+    const mAS = t.match(/^[!！]جمل[هة]\s+(\S+)\s+(\S+)\s*تلقائي/i);
+    if (mAS) return {cmd:'AUTO_GAME_TR_SENT',userLang:'Arabic',fromLang:LM[mAS[1]]||mAS[1],toLang:LM[mAS[2]]||mAS[2]};
+    const mAT = t.match(/^[!！]نص\s+(\S+)\s+(\S+)\s*تلقائي/i);
+    if (mAT) return {cmd:'AUTO_GAME_TR_TEXT',userLang:'Arabic',fromLang:LM[mAT[1]]||mAT[1],toLang:LM[mAT[2]]||mAT[2]};
+  }
+
   if (/^[!！]كلم[هة]\s*تلقائي/.test(tl))      return {cmd:'AUTO_GAME_TR_WORD',userLang:'Arabic'};
   if (/^[!！]جمل[هة]\s*تلقائي/.test(tl))      return {cmd:'AUTO_GAME_TR_SENT',userLang:'Arabic'};
   if (/^[!！]نص\s*تلقائي/.test(tl))            return {cmd:'AUTO_GAME_TR_TEXT',userLang:'Arabic'};
@@ -170,16 +190,13 @@ function fastDetect(text) {
     const LANG_MAP = {
       'عربي':'Arabic','عربية':'Arabic',
       'انجليزي':'English','انجليزية':'English','انكليزي':'English','إنجليزي':'English',
-      'فرنسي':'French','فرنسية':'French',
-      'تركي':'Turkish','تركية':'Turkish',
+      'فرنسي':'French','فرنسية':'French','تركي':'Turkish','تركية':'Turkish',
       'الماني':'German','المانية':'German','ألماني':'German',
       'اسباني':'Spanish','اسبانية':'Spanish','إسباني':'Spanish',
       'ايطالي':'Italian','ايطالية':'Italian','إيطالي':'Italian',
-      'فارسي':'Persian','فارسية':'Persian',
-      'اردو':'Urdu','أردو':'Urdu',
+      'فارسي':'Persian','فارسية':'Persian','اردو':'Urdu','أردو':'Urdu',
       'هندي':'Hindi','صيني':'Chinese','روسي':'Russian',
-      'ياباني':'Japanese','كوري':'Korean',
-      'برتغالي':'Portuguese','هولندي':'Dutch',
+      'ياباني':'Japanese','كوري':'Korean','برتغالي':'Portuguese','هولندي':'Dutch',
     };
     const mWord = t.match(/^[!！]كلم[هة]\s+(\S+)\s+(\S+)\s*بدء/i);
     if (mWord) {
@@ -209,16 +226,11 @@ function fastDetect(text) {
     const queryText = parts.slice(1).join(' ');
     const langMap = {
       'انجليزي':'English','انجليزية':'English','انكليزي':'English',
-      'عربي':'Arabic','عربية':'Arabic',
-      'فرنسي':'French','فرنسية':'French',
-      'تركي':'Turkish','تركية':'Turkish',
-      'الماني':'German','المانية':'German',
-      'اسباني':'Spanish','اسبانية':'Spanish',
-      'ايطالي':'Italian','ايطالية':'Italian',
-      'فارسي':'Persian','فارسية':'Persian',
-      'اردو':'Urdu','هندي':'Hindi',
-      'صيني':'Chinese','روسي':'Russian',
-      'ياباني':'Japanese','كوري':'Korean',
+      'عربي':'Arabic','عربية':'Arabic','فرنسي':'French','فرنسية':'French',
+      'تركي':'Turkish','تركية':'Turkish','الماني':'German','المانية':'German',
+      'اسباني':'Spanish','اسبانية':'Spanish','ايطالي':'Italian','ايطالية':'Italian',
+      'فارسي':'Persian','فارسية':'Persian','اردو':'Urdu','هندي':'Hindi',
+      'صيني':'Chinese','روسي':'Russian','ياباني':'Japanese','كوري':'Korean',
       'برتغالي':'Portuguese','هولندي':'Dutch',
     };
     const toLang = langMap[langWord] || langWord || 'English';
@@ -399,7 +411,6 @@ const WORD_TOPICS   = ['nature','animals','food','emotions','science','geography
 const SENT_TOPICS   = ['wisdom & proverbs','daily life','science facts','geography','historical events','nature wonders','technology','health tips','culture & traditions','economics','psychology','environment','education','famous quotes','sports'];
 const TEXT_TOPICS   = ['ancient civilizations','space exploration','natural phenomena','great inventors','world literature','ocean life','human psychology','environmental challenges','famous historical events','cultural heritage','medical breakthroughs','philosophical ideas','notable scientists','wildlife','economic history'];
 const GRAMMAR_TOPICS= ['daily activities','travel & transportation','family & relationships','work & career','education','food & cooking','weather & seasons','sports & hobbies','nature & environment','science & technology'];
-
 function pick(arr) { return arr[Math.floor(Math.random()*arr.length)]; }
 
 async function makeQ(type, lang, fromLang, toLang) {
@@ -423,9 +434,7 @@ async function makeQ(type, lang, fromLang, toLang) {
     const v2 = text.slice(k2Match.index + k2Match[0].length).trim();
     const before = text.slice(0, k2Match.index);
     const k1Match = k1Re.exec(before);
-    const v1 = k1Match
-      ? before.slice(k1Match.index + k1Match[0].length).trim()
-      : before.trim();
+    const v1 = k1Match ? before.slice(k1Match.index + k1Match[0].length).trim() : before.trim();
     if (!v1 || !v2) throw new Error('empty value k1='+k1+' k2='+k2);
     return [v1, v2];
   }
@@ -434,10 +443,10 @@ async function makeQ(type, lang, fromLang, toLang) {
     const topic = pick(WORD_TOPICS);
     return gemini(
 `Choose one unique ${gl} word related to the topic: "${topic}".
-Describe its meaning in 1-2 sentences in ${gl} WITHOUT mentioning the word.
+Describe its meaning in 1-2 sentences in ${gl} WITHOUT mentioning the word. Be creative and pick uncommon words.
 Reply ONLY in this format:
 WORD: [the word in ${gl}]
-MEANING: [the description in ${gl}]`, 150, 0.95
+MEANING: [the description in ${gl}]`, 200, 0.95
     ).then(raw => {
       console.log('[RAW GUESS]', raw.slice(0,120));
       const [word, meaning] = parseKV(raw,'WORD','MEANING');
@@ -630,7 +639,6 @@ const HELP_TEXT =
 📋 !لغه مساعده`;
 
 const client = new WOLF();
-
 let _connected   = false;
 let _reconnDelay = 5000;
 const MAX_DELAY  = 60000;
@@ -714,8 +722,7 @@ client.on('channelMessage', async (msg) => {
 
   if (cmd==='MY_SCORE') {
     const p = db.players[String(uid)];
-    const displayName = p?.name || String(uid);
-    await send(`🏆 ${displayName}: ${p?.pts||0} نقطة`);
+    await send(`🏆 ${p?.name||String(uid)}: ${p?.pts||0} نقطة`);
     return;
   }
 
@@ -729,9 +736,10 @@ client.on('channelMessage', async (msg) => {
   if (cmd==='RANK_GLOBAL') {
     const all = realPlayers();
     if (!all.length) { await send('🌍 لا يوجد لاعبون بعد!'); return; }
-    const idx = all.findIndex(p=>String(p.id)===String(uid));
-    const total = all.length;
-    await send(`🌍 ترتيبك: #${idx>=0?idx+1:'?'} من ${total} لاعب`);
+    const top10 = all.slice(0,10);
+    const idx   = all.findIndex(p=>String(p.id)===String(uid));
+    const myRank = idx>=0 ? `\n\n📍 ترتيبك: #${idx+1} من ${all.length} لاعب` : '';
+    await send('🌍 أفضل 10 لاعبين عالمياً:\n'+top10.map((p,i)=>`${i+1}- ${p.name} — ${p.pts} نقطة`).join('\n')+myRank);
     return;
   }
 
@@ -754,8 +762,7 @@ client.on('channelMessage', async (msg) => {
     const newType = AUTO_MAP[cmd];
     const curAuto = autoSt[cid];
     if (curAuto?.active && curAuto.type !== newType) {
-      const curLabel = LABEL[curAuto.type] || curAuto.type;
-      await send(`⚠️ يوجد وضع تلقائي نشط: ${curLabel}\nأوقفه أولاً بنفس الأمر قبل بدء نوع آخر.`);
+      await send(`⚠️ يوجد وضع تلقائي نشط: ${LABEL[curAuto.type]||curAuto.type}\nأوقفه أولاً بنفس الأمر قبل بدء نوع آخر.`);
       return;
     }
     await toggleAuto(cid, newType, lang, fl, tl);
@@ -765,8 +772,7 @@ client.on('channelMessage', async (msg) => {
   const GAME_CMDS = ['GAME_GUESS','GAME_WORD','GAME_TR_WORD','GAME_TR_SENT','GAME_TR_TEXT','GAME_GRAMMAR'];
   if (GAME_CMDS.includes(cmd)) {
     if (autoSt[cid]?.active) {
-      const curLabel = LABEL[autoSt[cid].type] || autoSt[cid].type;
-      await send(`⚠️ الوضع التلقائي نشط: ${curLabel}\nأوقفه أولاً قبل بدء لعبة يدوية.`);
+      await send(`⚠️ الوضع التلقائي نشط: ${LABEL[autoSt[cid].type]||autoSt[cid].type}\nأوقفه أولاً قبل بدء لعبة يدوية.`);
       return;
     }
     await startGame(cid, cmd, lang, fl, tl);
