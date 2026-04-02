@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
 // ╚══════════════════════════════════════════════════════════╝
 const BOT_EMAIL        = 'scodoublet@yahoo.com';  // إيميل الحساب
 const BOT_PASS         = '12345';                  // كلمة المرور
-const GEMINI_KEY_VPS   = 'AIzaSyBpZuXjoeyJthpSxd94X5DpekIUyjRck1k';    Google AI → https://aistudio.google.com/apikey
+const GEMINI_KEY_VPS   = 'AIzaSyBpZuXjoeyJthpSxd94X5DpekIUyjRck1k';   // Google AI → https://aistudio.google.com/apikey
 const GEMINI_MODEL_VPS = 'gemini-1.5-flash';       // النموذج على VPS (gemini-1.5-flash أو gemini-2.0-flash)
 // ═══════════════════════════════════════════════════════════
 
