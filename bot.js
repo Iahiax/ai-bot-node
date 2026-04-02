@@ -131,7 +131,6 @@ function realPlayersInChannel(cid) {
     .sort((a,b) => b.pts - a.pts);
 }
 
-// ─── حالة الألعاب ──────────────────────────────────────────────────────────────
 const games    = {};
 const autoSt   = {};
 const pregenQ  = {};
@@ -141,17 +140,8 @@ const lastAns  = {};
 // ─── فلتر المحتوى الإباحي ─────────────────────────────────────────────────────
 const VULGAR_RE = /زب|كس|طيز|شرم|عاهر|ق[حض]ب[هة]|منيو[كك]|متناك|ينيك|بتناك|نيك|شراميط|عرص|لوطي|خول|فاجر[هة]?|داعر[هة]?|فاحش[هة]?|porn|sex(?:ual|y)?|fuck|shit|bitch|cock|pussy|ass(?:hole)?|dick|nude|naked|xxx/i;
 
-async function isVulgar(text) {
-  if (VULGAR_RE.test(text)) return true;
-  try {
-    const r = await gemini(
-      `Answer YES if the following word/text is sexual, pornographic, adult-only, or vulgar. Answer NO otherwise.\nText: "${text.slice(0,120)}"\nAnswer (YES/NO only):`,
-      5, 0
-    );
-    return /^YES/i.test(r.trim());
-  } catch(e) {
-    return true;
-  }
+function isVulgar(text) {
+  return VULGAR_RE.test(text);
 }
 
 // ─── الكشف السريع عن الأوامر ─────────────────────────────────────────────────
@@ -288,9 +278,11 @@ For TR games: extract fromLang/toLang if mentioned.
 JSON only: {"cmd":"","userLang":"","fromLang":"","toLang":"","queryText":""}`,
       512, 0
     );
+    console.log(`[INTENT] "${text.slice(0,30)}" → ${r.cmd} [${r.userLang}]`);
     if (r.cmd === 'UNKNOWN') unknownCache.set(ck, Date.now());
     return r;
   } catch(e) {
+    console.error('[INTENT ERR]', e.message?.slice(0,60));
     unknownCache.set(ck, Date.now());
     return {cmd:'UNKNOWN',userLang:'Arabic',fromLang:'',toLang:'',queryText:''};
   }
@@ -310,7 +302,7 @@ The player was shown this DESCRIPTION/CLUE in ${ansLang}: "${game.display.slice(
 The player must GUESS THE WORD that matches this description.
 Correct word: "${game.answer}"
 Player's guess: "${playerMsg}"
-RULES: Accept the exact word, common spelling variations, or very close synonyms.`;
+RULES: Accept the exact word, common spelling variations, or very close synonyms. Do NOT accept unrelated words.`;
     } else if (game.type === 'GAME_WORD') {
       context =
 `GAME TYPE: Word meaning game
@@ -318,7 +310,7 @@ The player was shown this WORD in ${ansLang}: "${game.question}"
 The player must EXPLAIN THE MEANING of this word.
 Reference meaning: "${game.answer.slice(0,300)}"
 Player's explanation: "${playerMsg}"
-RULES: Accept any explanation that correctly captures the core meaning.`;
+RULES: Accept any explanation that correctly captures the core meaning. Accept synonyms, partial definitions, paraphrasing.`;
     } else if (game.type === 'GAME_TR_WORD') {
       context =
 `GAME TYPE: Word translation game
@@ -334,7 +326,7 @@ The player was shown this sentence in ${game.fromLang}: "${game.question.slice(0
 The player must translate it to ${game.toLang}.
 Reference translation: "${game.answer.slice(0,300)}"
 Player's translation: "${playerMsg.slice(0,300)}"
-RULES: Accept any translation that conveys the same meaning.`;
+RULES: Accept any translation that conveys the same meaning, even if worded differently.`;
     } else if (game.type === 'GAME_TR_TEXT') {
       context =
 `GAME TYPE: Paragraph translation game
@@ -342,7 +334,7 @@ The player was shown this paragraph in ${game.fromLang}: "${game.question.slice(
 The player must translate it to ${game.toLang}.
 Reference translation: "${game.answer.slice(0,400)}"
 Player's translation: "${playerMsg.slice(0,400)}"
-RULES: Grade based on overall meaning accuracy.`;
+RULES: Grade based on overall meaning accuracy. Accept paraphrasing.`;
     }
     const raw = await gemini(
 `You are a fair language game judge. Grade the player's answer strictly according to the game context below.
@@ -367,8 +359,10 @@ pct=XX pts=YY diff=سهل/متوسط/صعب ok=true/false feedback=ONE_SENTENCE_
     const diff   = raw.match(/diff=([^\s]+)/)?.[1]        || 'متوسط';
     const ok     = /ok=true/i.test(raw);
     const fb     = raw.match(/feedback=(.+)/)?.[1]?.trim() || '';
+    console.log(`[EVAL] type=${game.type} pct=${pct} pts=${pts} ok=${ok} max=${maxPts}`);
     return { correct: ok || pct>=40, pct, pts, difficulty:2, diffLabel:diff, feedback:fb };
   } catch(e) {
+    console.error('[EVAL ERR]', e.message?.slice(0,80));
     return { correct:false, pct:0, pts:0, difficulty:1, diffLabel:'', feedback:'' };
   }
 }
@@ -378,12 +372,13 @@ async function evalGrammar(game, playerMsg) {
     const raw = await gemini(
 `Grammar analysis judge. Sentence: "${game.question.slice(0,150)}"
 Player's analysis: "${playerMsg.slice(0,300)}"
-GRADING SCALE:
-- Completely wrong = 0-20%
+GRADING SCALE (medium difficulty):
+- Completely wrong or irrelevant = 0-20%
 - Mentions one grammar term but mostly wrong = 30-40%
-- Partial analysis = 50-65%
-- Good analysis = 70-84%
-- Complete and accurate = 85-100%
+- Partial analysis, some correct roles = 50-65%
+- Good analysis, most roles correct = 70-84%
+- Complete and accurate analysis = 85-100%
+Be fair but not overly strict. Reward genuine effort.
 Reply with ONLY: pct=XX pts=YY feedback=SHORT_ARABIC_SENTENCE`,
       120, 0
     );
@@ -391,6 +386,7 @@ Reply with ONLY: pct=XX pts=YY feedback=SHORT_ARABIC_SENTENCE`,
     const pct = playerMsg.trim().length > 3 ? Math.max(rawPct, 30) : rawPct;
     const pts = Math.min(Math.round(pct/100*10), 10);
     const fb  = raw.match(/feedback=(.+)/)?.[1]?.trim() || 'حاول مجدداً! 💪';
+    console.log(`[GRAMMAR EVAL] pct=${pct} pts=${pts}`);
     return { correct: pct>=40, pct, pts, difficulty:2, diffLabel:'متوسط', feedback:fb };
   } catch(e) {
     const defaultPct = playerMsg.trim().length > 3 ? 40 : 0;
@@ -410,16 +406,27 @@ async function makeQ(type, lang, fromLang, toLang) {
   const gl = lang||fromLang||'Arabic';
   const fl = fromLang||gl;
   const tl = toLang||'English';
+
   function parseKV(raw, k1, k2) {
-    const text = raw.replace(/\r\n/g,'\n').replace(/\r/g,'\n');
-    const k2Idx = text.search(new RegExp('(?:^|\\n)\\s*'+k2+'\\s*:', 'i'));
-    if (k2Idx === -1) throw new Error('k2 not found: '+k2);
-    const afterK2  = text.slice(k2Idx).replace(new RegExp('^[\\s\\S]*?'+k2+'\\s*:\\s*','i'),'').trim();
-    const beforeK2 = text.slice(0, k2Idx);
-    const afterK1  = beforeK2.replace(new RegExp('^[\\s\\S]*?'+k1+'\\s*:\\s*','i'),'').trim();
-    const v1 = afterK1 || beforeK2.trim();
-    const v2 = afterK2;
-    if (!v1 || !v2) throw new Error('empty value');
+    const text = raw
+      .replace(/\r\n/g,'\n').replace(/\r/g,'\n')
+      .replace(/\*\*([^*]+)\*\*/g,'$1')
+      .replace(/\*([^*]+)\*/g,'$1')
+      .replace(/`([^`]+)`/g,'$1');
+    const k2Re = new RegExp('(?:^|\\n)[\\s*]*'+k2+'[\\s*]*:[\\s*]*', 'i');
+    const k1Re = new RegExp('(?:^|\\n)[\\s*]*'+k1+'[\\s*]*:[\\s*]*', 'i');
+    const k2Match = k2Re.exec(text);
+    if (!k2Match) {
+      console.warn('[PARSEKV] k2 not found:', k2, '| raw:', text.slice(0,120));
+      throw new Error('k2 not found: '+k2);
+    }
+    const v2 = text.slice(k2Match.index + k2Match[0].length).trim();
+    const before = text.slice(0, k2Match.index);
+    const k1Match = k1Re.exec(before);
+    const v1 = k1Match
+      ? before.slice(k1Match.index + k1Match[0].length).trim()
+      : before.trim();
+    if (!v1 || !v2) throw new Error('empty value k1='+k1+' k2='+k2);
     return [v1, v2];
   }
 
@@ -432,27 +439,31 @@ Reply ONLY in this format:
 WORD: [the word in ${gl}]
 MEANING: [the description in ${gl}]`, 150, 0.95
     ).then(raw => {
+      console.log('[RAW GUESS]', raw.slice(0,120));
       const [word, meaning] = parseKV(raw,'WORD','MEANING');
       return {question:word, answer:word, display:meaning};
     });
   }
+
   if (type==='GAME_WORD') {
     const topic = pick(WORD_TOPICS);
     return gemini(
-`Choose one interesting ${gl} word related to the topic: "${topic}".
+`Choose one interesting ${gl} word related to the topic: "${topic}". Pick a varied and educational word.
 Write its meaning in 1-2 sentences in ${gl}.
 Reply ONLY in this format:
 WORD: [the word in ${gl}]
 MEANING: [the meaning in ${gl}]`, 200, 0.95
     ).then(raw => {
+      console.log('[RAW WORD]', raw.slice(0,120));
       const [word, meaning] = parseKV(raw,'WORD','MEANING');
       return {question:word, answer:meaning, display:word};
     });
   }
+
   if (type==='GAME_TR_WORD') {
     const topic = pick(WORD_TOPICS);
     return gemini(
-`Give one ${fl} word related to the topic: "${topic}" and its ${tl} translation.
+`Give one ${fl} word related to the topic: "${topic}" and its ${tl} translation. Vary the word each time.
 Reply ONLY in this format:
 WORD: [the word in ${fl}]
 TRANSLATION: [the translation in ${tl}]`, 100, 0.95
@@ -461,10 +472,11 @@ TRANSLATION: [the translation in ${tl}]`, 100, 0.95
       return {question:word, answer:trans, display:word};
     });
   }
+
   if (type==='GAME_TR_SENT') {
     const topic = pick(SENT_TOPICS);
     return gemini(
-`Write one original educational sentence (max 12 words) in ${fl} about: "${topic}". No politics/religion/adult.
+`Write one original educational sentence (max 12 words) in ${fl} about: "${topic}". Make it unique every time. No politics/religion/adult.
 Then give its ${tl} translation.
 Reply ONLY in this format:
 SENTENCE: [the sentence in ${fl}]
@@ -474,10 +486,11 @@ TRANSLATION: [the translation in ${tl}]`, 200, 0.95
       return {question:sent, answer:trans, display:sent};
     });
   }
+
   if (type==='GAME_TR_TEXT') {
     const topic = pick(TEXT_TOPICS);
     return gemini(
-`Write a unique educational paragraph (3-5 sentences) in ${fl} about: "${topic}". No politics/religion/adult.
+`Write a unique educational paragraph (3-5 sentences) in ${fl} about: "${topic}". Make it original and interesting. No politics/religion/adult.
 Then write its complete ${tl} translation.
 Reply ONLY in this format:
 TEXT: [the paragraph in ${fl}]
@@ -487,10 +500,11 @@ TRANSLATION: [the translation in ${tl}]`, 700, 0.95
       return {question:text, answer:trans, display:text};
     });
   }
+
   if (type==='GAME_GRAMMAR') {
     const topic = pick(GRAMMAR_TOPICS);
     return gemini(
-`Write one original ${gl} sentence (5-8 words) about "${topic}" suitable for grammar analysis.
+`Write one original ${gl} sentence (5-8 words) about "${topic}" suitable for grammar analysis. Make it varied and educational.
 Then write a brief grammatical analysis (2-3 lines) in ${gl}.
 Reply ONLY in this format:
 SENTENCE: [the sentence]
@@ -539,24 +553,30 @@ function resetIdleTimer(cid) {
     } else {
       await send(`⏰ انتهى وقت السؤال!\n✅ الإجابة: ${ans}`);
     }
+    console.log(`[IDLE TIMEOUT] cid=${cid} auto=${isAuto} → stopped`);
   }, GAME_IDLE_MS);
 }
-
 function endAuto(cid) { delete autoSt[cid]; }
 
 async function startGame(cid, type, lang, fromLang, toLang) {
+  console.log(`[START GAME] type=${type} lang=${lang} fl=${fromLang} tl=${toLang}`);
   endGame(cid);
   const {send,alert} = io(cid);
   await send('⏳...');
   let q;
-  try {
-    const pre = pregenQ[cid];
-    if (pre?.type===type) { q=pre; delete pregenQ[cid]; }
-    else q = await makeQ(type, lang, fromLang, toLang);
-  } catch(e) {
-    await alert('⚠️ حدث خطأ، حاول مجدداً.');
-    return;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const pre = pregenQ[cid];
+      if (attempt === 1 && pre?.type===type) { q=pre; delete pregenQ[cid]; break; }
+      q = await makeQ(type, lang, fromLang, toLang);
+      break;
+    } catch(e) {
+      console.error(`[MAKEQ ERR attempt=${attempt}]`, type, e.message?.slice(0,80));
+      if (attempt === 3) { await alert('⚠️ حدث خطأ، حاول مجدداً.'); return; }
+      await sleep(1500);
+    }
   }
+  if (!q) return;
   games[cid] = {type,lang,fromLang,toLang,...q};
   resetIdleTimer(cid);
   makeQ(type,lang,fromLang,toLang).then(nq=>{ pregenQ[cid]={type,...nq}; }).catch(()=>{});
@@ -629,7 +649,7 @@ client.on('disconnected', r => { _connected = false; scheduleReconnect(`disconne
 
 setInterval(() => {
   if (!_connected) {
-    console.warn('[WATCHDOG] غير متصل — إعادة محاولة...');
+    console.warn('[WATCHDOG] غير متصل — إعادة محاولة الاتصال...');
     client.login(BOT_EMAIL, BOT_PASS).catch(e => console.error('[WATCHDOG ERR]', e.message));
   }
 }, 2 * 60 * 1000);
@@ -649,7 +669,6 @@ client.on('channelMessage', async (msg) => {
 
   const {send,alert} = io(cid);
 
-  // ─── تقييم الإجابة (رسائل تبدأ بـ # في قناة فيها لعبة) ─────────────────
   if (hasGame && isAns) {
     const key = `${cid}_${uid}`;
     if (lastAns[key] && Date.now()-lastAns[key]<3000) return;
@@ -664,7 +683,6 @@ client.on('channelMessage', async (msg) => {
       const ev = await evalAnswer(games[cid], answerText);
       const diff = ev.diffLabel ? ` | ${ev.diffLabel}` : '';
       if (ev.correct || ev.pct>=30) {
-        // ─── تسجيل اللاعب فقط عند الحصول على نقاط ───────────────────────
         let name = String(uid);
         try { const s = await client.subscriber.getById(uid); if(s?.nickname) name=s.nickname; } catch(e){}
         getPlayer(uid, name, cid);
@@ -758,7 +776,7 @@ client.on('channelMessage', async (msg) => {
   if (cmd==='MEANING') {
     const q = queryText||text.replace(/^[!！]\S+\s*/,'').trim();
     if (!q) return;
-    if (await isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
+    if (isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
     await send('⏳...');
     try {
       const ans = await gemini(`Define "${q}" in ${lang}. Reply in ONE sentence only, max 15 words. No labels, no extra text.`, 80, 0.3);
@@ -770,7 +788,7 @@ client.on('channelMessage', async (msg) => {
   if (cmd==='TRANSLATE') {
     const q = queryText||text.replace(/^[!！]\S+\s*/,'').trim();
     if (!q) return;
-    if (await isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
+    if (isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
     await send('⏳...');
     try {
       const ans = await gemini(`Translate to ${tl}. Return ONLY the translation:\n${q}`, 300, 0.3);
