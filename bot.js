@@ -5,26 +5,27 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-try {
-  const envPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '.env');
-  if (fs.existsSync(envPath)) {
-    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
-    for (const line of lines) {
-      const m = line.trim().match(/^([^#=]+)=(.*)$/);
-      if (m) process.env[m[1].trim()] = m[2].trim().replace(/^["']|["']$/g, '');
-    }
-  }
-} catch(_) {}
+// ╔══════════════════════════════════════════════════════════╗
+// ║           ⚙️  إعدادات البوت — عدّل هذا القسم            ║
+// ╚══════════════════════════════════════════════════════════╝
+const BOT_EMAIL        = 'scodoublet@yahoo.com';  // إيميل الحساب
+const BOT_PASS         = '12345';                  // كلمة المرور
+const GEMINI_KEY_VPS   = 'ضع_مفتاحك_هنا';        // مفتاح Google AI → https://aistudio.google.com/apikey
+const GEMINI_MODEL_VPS = 'gemini-1.5-flash';       // النموذج على VPS (gemini-1.5-flash أو gemini-2.0-flash)
+// ═══════════════════════════════════════════════════════════
 
 const __dirname  = path.dirname(fileURLToPath(import.meta.url));
-const BOT_EMAIL  = 'scodoublet@yahoo.com';
-const BOT_PASS   = '12345';
 const DATA_FILE  = path.join(__dirname, 'players.json');
 
-const _geminiKey     = process.env.AI_INTEGRATIONS_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+// ─── Gemini — على Replit يستخدم المتغيرات التلقائية، على VPS يستخدم القيم أعلاه ───
 const _geminiBaseUrl = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
-const _isReplit      = !!process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
-const GEMINI_MODEL   = process.env.GEMINI_MODEL || (_isReplit ? 'gemini-2.5-flash' : 'gemini-1.5-flash');
+const _isReplit      = !!_geminiBaseUrl;
+const _geminiKey     = process.env.AI_INTEGRATIONS_GEMINI_API_KEY
+                    || process.env.GEMINI_API_KEY
+                    || process.env.GOOGLE_API_KEY
+                    || GEMINI_KEY_VPS;
+const GEMINI_MODEL   = process.env.GEMINI_MODEL
+                    || (_isReplit ? 'gemini-2.5-flash' : GEMINI_MODEL_VPS);
 console.log(`[AI] نموذج Gemini: ${GEMINI_MODEL} | Replit=${_isReplit}`);
 const ai = new GoogleGenAI({
   apiKey: _geminiKey,
@@ -33,6 +34,7 @@ const ai = new GoogleGenAI({
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ─── تحكم في معدل الطلبات — منع تجاوز الحصة ─────────────────────────────────
 let _lastCall = 0;
 let _activeCall = false;
 const CALL_GAP_MS = _isReplit ? 1200 : 4000;
@@ -92,6 +94,7 @@ async function geminiJSON(prompt, maxTokens = 512, temp = 0) {
   }
 }
 
+// ─── قاعدة البيانات ───────────────────────────────────────────────────────────
 function loadDB() {
   try { if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE,'utf8')); }
   catch(e) {}
@@ -135,15 +138,18 @@ function realPlayersInChannel(cid) {
     .sort((a,b) => b.pts - a.pts);
 }
 
+// ─── حالة الألعاب ──────────────────────────────────────────────────────────────
 const games    = {};
 const autoSt   = {};
 const pregenQ  = {};
 const busy     = {};
 const lastAns  = {};
 
+// ─── فلتر المحتوى الإباحي ─────────────────────────────────────────────────────
 const VULGAR_RE = /زب|كس|طيز|شرم|عاهر|ق[حض]ب[هة]|منيو[كك]|متناك|ينيك|بتناك|نيك|شراميط|عرص|لوطي|خول|فاجر[هة]?|داعر[هة]?|فاحش[هة]?|porn|sex(?:ual|y)?|fuck|shit|bitch|cock|pussy|ass(?:hole)?|dick|nude|naked|xxx/i;
 function isVulgar(text) { return VULGAR_RE.test(text); }
 
+// ─── الكشف السريع عن الأوامر العربية (بدون AI) ───────────────────────────────
 function fastDetect(text) {
   const t = text.trim();
   const tl = t.toLowerCase().replace(/\s+/g,' ');
@@ -153,6 +159,7 @@ function fastDetect(text) {
   if (/^[!！](لغه|لغة)\s*ترتيب\s*قنا/.test(tl)) return {cmd:'RANK_CHANNEL',userLang:'Arabic'};
   if (/^[!！](لغه|لغة)\s*ترتيب\s*(ولف|wolf)/.test(tl)) return {cmd:'RANK_GLOBAL',userLang:'Arabic'};
   if (/^[!！](لغه|لغة)\s*(التالي|تالي)/.test(tl)) return {cmd:'NEXT',userLang:'Arabic'};
+  if (/^[!！](لغه|لغة)\s*(اختبار|تشخيص)/.test(tl)) return {cmd:'DIAG',userLang:'Arabic'};
 
   if (/^[!！]معرفات\s*تلقائي/.test(tl)) return {cmd:'AUTO_GAME_GUESS',userLang:'Arabic'};
   if (/^[!！]معاني\s*تلقائي/.test(tl))  return {cmd:'AUTO_GAME_WORD',userLang:'Arabic'};
@@ -177,10 +184,10 @@ function fastDetect(text) {
     if (mAT) return {cmd:'AUTO_GAME_TR_TEXT',userLang:'Arabic',fromLang:LM[mAT[1]]||mAT[1],toLang:LM[mAT[2]]||mAT[2]};
   }
 
-  if (/^[!！]كلم[هة]\s*تلقائي/.test(tl))      return {cmd:'AUTO_GAME_TR_WORD',userLang:'Arabic'};
-  if (/^[!！]جمل[هة]\s*تلقائي/.test(tl))      return {cmd:'AUTO_GAME_TR_SENT',userLang:'Arabic'};
-  if (/^[!！]نص\s*تلقائي/.test(tl))            return {cmd:'AUTO_GAME_TR_TEXT',userLang:'Arabic'};
-  if (/^[!！](اعرب|إعراب)\s*تلقائي/.test(tl)) return {cmd:'AUTO_GAME_GRAMMAR',userLang:'Arabic'};
+  if (/^[!！]كلم[هة]\s*تلقائي/.test(tl))         return {cmd:'AUTO_GAME_TR_WORD',userLang:'Arabic'};
+  if (/^[!！]جمل[هة]\s*تلقائي/.test(tl))         return {cmd:'AUTO_GAME_TR_SENT',userLang:'Arabic'};
+  if (/^[!！]نص\s*تلقائي/.test(tl))               return {cmd:'AUTO_GAME_TR_TEXT',userLang:'Arabic'};
+  if (/^[!！](اعرب|إعراب)\s*تلقائي/.test(tl))    return {cmd:'AUTO_GAME_GRAMMAR',userLang:'Arabic'};
 
   if (/^[!！]معرفات\s*بدء$/.test(tl)) return {cmd:'GAME_GUESS',  userLang:'Arabic'};
   if (/^[!！]معاني\s*بدء/.test(tl))   return {cmd:'GAME_WORD',   userLang:'Arabic'};
@@ -240,6 +247,7 @@ function fastDetect(text) {
   return null;
 }
 
+// ─── قائمة سوداء للبوتات الأخرى ─────────────────────────────────────────────
 const OTHER_BOT_PREFIXES = [
   '!نان','!مد','!س ','!ص ','!ط ','!عدنان','!صور','!صوره',
   '!welcome','!ترحيب','!auto','!أوتو','!موسيقى','!music',
@@ -300,6 +308,7 @@ JSON only: {"cmd":"","userLang":"","fromLang":"","toLang":"","queryText":""}`,
   }
 }
 
+// ─── نظام التقييم الذكي ────────────────────────────────────────────────────────
 async function evalAnswer(game, playerMsg) {
   if (game.type === 'GAME_GRAMMAR') return evalGrammar(game, playerMsg);
   try {
@@ -407,6 +416,7 @@ Reply with ONLY: pct=XX pts=YY feedback=SHORT_ARABIC_SENTENCE`,
   }
 }
 
+// ─── توليد الأسئلة ────────────────────────────────────────────────────────────
 const WORD_TOPICS   = ['nature','animals','food','emotions','science','geography','history','technology','sports','art','human body','weather','space','ocean','plants','music','architecture','literature','philosophy','medicine'];
 const SENT_TOPICS   = ['wisdom & proverbs','daily life','science facts','geography','historical events','nature wonders','technology','health tips','culture & traditions','economics','psychology','environment','education','famous quotes','sports'];
 const TEXT_TOPICS   = ['ancient civilizations','space exploration','natural phenomena','great inventors','world literature','ocean life','human psychology','environmental challenges','famous historical events','cultural heritage','medical breakthroughs','philosophical ideas','notable scientists','wildlife','economic history'];
@@ -448,7 +458,6 @@ Reply ONLY in this format:
 WORD: [the word in ${gl}]
 MEANING: [the description in ${gl}]`, 200, 0.95
     ).then(raw => {
-      console.log('[RAW GUESS]', raw.slice(0,120));
       const [word, meaning] = parseKV(raw,'WORD','MEANING');
       return {question:word, answer:word, display:meaning};
     });
@@ -463,7 +472,6 @@ Reply ONLY in this format:
 WORD: [the word in ${gl}]
 MEANING: [the meaning in ${gl}]`, 200, 0.95
     ).then(raw => {
-      console.log('[RAW WORD]', raw.slice(0,120));
       const [word, meaning] = parseKV(raw,'WORD','MEANING');
       return {question:word, answer:meaning, display:word};
     });
@@ -562,7 +570,6 @@ function resetIdleTimer(cid) {
     } else {
       await send(`⏰ انتهى وقت السؤال!\n✅ الإجابة: ${ans}`);
     }
-    console.log(`[IDLE TIMEOUT] cid=${cid} auto=${isAuto} → stopped`);
   }, GAME_IDLE_MS);
 }
 function endAuto(cid) { delete autoSt[cid]; }
@@ -573,6 +580,7 @@ async function startGame(cid, type, lang, fromLang, toLang) {
   const {send,alert} = io(cid);
   await send('⏳...');
   let q;
+  let lastErr = '';
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const pre = pregenQ[cid];
@@ -580,9 +588,18 @@ async function startGame(cid, type, lang, fromLang, toLang) {
       q = await makeQ(type, lang, fromLang, toLang);
       break;
     } catch(e) {
-      console.error(`[MAKEQ ERR attempt=${attempt}]`, type, e.message?.slice(0,80));
-      if (attempt === 3) { await alert('⚠️ حدث خطأ، حاول مجدداً.'); return; }
-      await sleep(1500);
+      lastErr = e.message || String(e);
+      console.error(`[MAKEQ ERR attempt=${attempt}]`, type, lastErr.slice(0,120));
+      if (attempt === 3) {
+        const reason = lastErr.includes('API_KEY') ? '🔑 مفتاح API خاطئ أو مفقود'
+          : lastErr.includes('429') || lastErr.includes('RATE') ? '⏱ تجاوز حصة API — انتظر قليلاً'
+          : lastErr.includes('not found') || lastErr.includes('404') ? '🤖 النموذج غير متاح: '+GEMINI_MODEL
+          : lastErr.includes('400') ? '❌ خطأ 400 — تحقق من إعدادات API'
+          : lastErr.slice(0,60);
+        await alert(`⚠️ فشل توليد السؤال:\n${reason}`);
+        return;
+      }
+      await sleep(2000);
     }
   }
   if (!q) return;
@@ -636,9 +653,12 @@ const HELP_TEXT =
 🏆 !لغه مجموع
 📊 !لغه ترتيب قناه
 🌍 !لغه ترتيب ولف
-📋 !لغه مساعده`;
+📋 !لغه مساعده
+🔧 !لغه اختبار`;
 
+// ─── Wolf Bot ─────────────────────────────────────────────────────────────────
 const client = new WOLF();
+
 let _connected   = false;
 let _reconnDelay = 5000;
 const MAX_DELAY  = 60000;
@@ -717,6 +737,42 @@ client.on('channelMessage', async (msg) => {
   const lang = userLang||'Arabic';
   const fl   = fromLang||lang;
   const tl   = toLang||'English';
+
+  if (cmd==='DIAG') {
+    const keySource = process.env.AI_INTEGRATIONS_GEMINI_API_KEY ? 'AI_INTEGRATIONS (Replit)'
+      : process.env.GEMINI_API_KEY   ? 'GEMINI_API_KEY'
+      : process.env.GOOGLE_API_KEY   ? 'GOOGLE_API_KEY'
+      : GEMINI_KEY_VPS !== 'ضع_مفتاحك_هنا' ? 'GEMINI_KEY_VPS (مدمج)'
+      : '❌ لا يوجد مفتاح!';
+    const keyOk = !!_geminiKey && _geminiKey !== 'ضع_مفتاحك_هنا';
+    await send(
+      `🔧 تشخيص البوت:\n` +
+      `• Replit = ${_isReplit}\n` +
+      `• نموذج = ${GEMINI_MODEL}\n` +
+      `• مصدر المفتاح = ${keySource}\n` +
+      `• المفتاح موجود = ${keyOk ? '✅' : '❌'}\n` +
+      `• جاري الاختبار...`
+    );
+    if (!keyOk) {
+      await alert('❌ لا يوجد مفتاح API!\nعدّل GEMINI_KEY_VPS في أعلى ملف bot.js');
+      return;
+    }
+    try {
+      const t0 = Date.now();
+      const r = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [{ role:'user', parts:[{ text:'Reply OK' }] }],
+        config: { maxOutputTokens: 5, temperature: 0 },
+      });
+      const ms  = Date.now() - t0;
+      const txt = (r.text||'').trim().slice(0,20);
+      await send(`✅ Gemini يعمل! (${ms}ms)\nرد: "${txt}"\nنموذج: ${GEMINI_MODEL}`);
+    } catch(e) {
+      const fullMsg = (e.message || String(e)).slice(0, 400);
+      await alert(`❌ خطأ Gemini الكامل:\n${fullMsg}`);
+    }
+    return;
+  }
 
   if (cmd==='HELP') { await send(HELP_TEXT); return; }
 
