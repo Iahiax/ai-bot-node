@@ -10,7 +10,21 @@ import { fileURLToPath } from 'url';
 // ╚══════════════════════════════════════════════════════════╝
 const BOT_EMAIL        = 'scodoublet@yahoo.com';  // إيميل الحساب
 const BOT_PASS         = '12345';                  // كلمة المرور
-const GEMINI_KEY_VPS   = 'AIzaSyBpZuXjoeyJthpSxd94X5DpekIUyjRck1k';                          // Google AI → https://aistudio.google.com/apikey
+// مفاتيح Gemini — أضف حتى 5 مفاتيح من حسابات Google مختلفة
+// عند انتهاء حصة أحدها ينتقل البوت تلقائياً للمفتاح التالي
+// احصل على مفاتيح مجانية من: https://aistudio.google.com/apikey
+const GEMINI_KEYS_VPS = [
+  'AIzaSyBpZuXjoeyJthpSxd94X5DpekIUyjRck1k',  // المفتاح 1
+  'AIzaSyCS_WBaaRpIDJaeuxEgpOhzA513FQbkxSk',  // المفتاح 2
+  'AIzaSyDaySrfpSPkQ7_jivlK1dQStJfIlZLifEA',  // المفتاح 3
+  'AIzaSyA_zBovMEEn40Th1g6WkSRDG08omJ3olT0',  // المفتاح 4
+  'AIzaSyD-WJcT7JM1juR1Lsf5Nlj8tDSqGTszPu0',  // المفتاح 5
+  'AIzaSyBZwbEQIHNAjFnXJiT4l1J4CUR0-b43rtk',  // المفتاح 6
+  'AIzaSyAq6UXXTKfWXk5LBoPeOjLdoGET7iR_RpA',  // المفتاح 7
+  'AIzaSyBfsBLetUtLk4wepMjuhQyCZUGs2ABYpEA',   // المفتاح 8
+  'AIzaSyCuB9_OcSJgnL2soWYuPmY0rVIBl1Bw2KY',  // المفتاح 9
+  'AIzaSyAtdTunaYFOKr_kma3Vl7RG-8per7eB5dQ',  // المفتاح 10
+];
 const GEMINI_MODEL_VPS = 'gemini-2.0-flash';       // النموذج على VPS
 // ═══════════════════════════════════════════════════════════
 
@@ -20,17 +34,44 @@ const DATA_FILE  = path.join(__dirname, 'players.json');
 // ─── Gemini — على Replit يستخدم المتغيرات التلقائية، على VPS يستخدم القيم أعلاه ───
 const _geminiBaseUrl = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
 const _isReplit      = !!_geminiBaseUrl;
-const _geminiKey     = process.env.AI_INTEGRATIONS_GEMINI_API_KEY
-                    || process.env.GEMINI_API_KEY
-                    || process.env.GOOGLE_API_KEY
-                    || GEMINI_KEY_VPS;
-const GEMINI_MODEL   = process.env.GEMINI_MODEL
-                    || (_isReplit ? 'gemini-2.5-flash' : GEMINI_MODEL_VPS);
-console.log(`[AI] نموذج Gemini: ${GEMINI_MODEL} | Replit=${_isReplit}`);
-const ai = new GoogleGenAI({
-  apiKey: _geminiKey,
-  ..._geminiBaseUrl ? { httpOptions: { apiVersion: '', baseUrl: _geminiBaseUrl } } : {},
-});
+
+// ─── نظام تدوير المفاتيح ─────────────────────────────────────────────────────
+// على Replit: مفتاح واحد من المتغيرات البيئية
+// على VPS: قائمة المفاتيح مع تبديل تلقائي عند انتهاء الحصة
+const _replitKey = process.env.AI_INTEGRATIONS_GEMINI_API_KEY
+               || process.env.GEMINI_API_KEY
+               || process.env.GOOGLE_API_KEY;
+
+// تصفية المفاتيح الحقيقية فقط (غير فارغة وغير placeholder)
+const _vpsKeys = GEMINI_KEYS_VPS.filter(k => k && !k.includes('ضع_مفتاح'));
+let _keyIndex  = 0; // المفتاح النشط حالياً
+
+function currentKey() {
+  if (_isReplit) return _replitKey;
+  if (_vpsKeys.length === 0) return 'NO_KEY';
+  return _vpsKeys[_keyIndex % _vpsKeys.length];
+}
+
+function nextKey() {
+  _keyIndex++;
+  const idx = _keyIndex % _vpsKeys.length;
+  console.warn(`[KEY ROTATE] → مفتاح #${idx + 1} من ${_vpsKeys.length}`);
+  return _vpsKeys[idx];
+}
+
+// بناء كائن GoogleGenAI من مفتاح معين
+function buildAI(key) {
+  return new GoogleGenAI({
+    apiKey: key,
+    ..._geminiBaseUrl ? { httpOptions: { apiVersion: '', baseUrl: _geminiBaseUrl } } : {},
+  });
+}
+
+let ai = buildAI(currentKey());
+
+const GEMINI_MODEL = process.env.GEMINI_MODEL
+                  || (_isReplit ? 'gemini-2.5-flash' : GEMINI_MODEL_VPS);
+console.log(`[AI] نموذج Gemini: ${GEMINI_MODEL} | Replit=${_isReplit} | مفاتيح VPS=${_vpsKeys.length}`);
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -48,6 +89,9 @@ function buildConfig(maxTokens, temp) {
   return base;
 }
 
+// مجموعة المفاتيح المنتهية حصتها اليوم (تُصفّى تلقائياً)
+const _exhaustedKeys = new Set();
+
 async function gemini(prompt, maxTokens = 4096, temp = 0.7) {
   while (_activeCall) await sleep(200);
   const gap = CALL_GAP_MS - (Date.now() - _lastCall);
@@ -62,8 +106,36 @@ async function gemini(prompt, maxTokens = 4096, temp = 0.7) {
     });
     return (r.text || '').trim();
   } catch (e) {
-    const msg = e.message || '';
-    if (msg.includes('RATELIMIT') || msg.includes('429')) {
+    const msg = e.message || String(e);
+    if (msg.includes('429')) {
+      const isQuota = msg.includes('quota') || msg.includes('QUOTA') || msg.includes('billing');
+      if (isQuota && !_isReplit && _vpsKeys.length > 1) {
+        // ─── تدوير المفاتيح: انتقل للمفتاح التالي ───────────────────────
+        const usedKey = currentKey();
+        _exhaustedKeys.add(usedKey);
+        // ابحث عن مفتاح غير منتهٍ
+        const available = _vpsKeys.filter(k => !_exhaustedKeys.has(k));
+        if (available.length > 0) {
+          _keyIndex = _vpsKeys.indexOf(available[0]);
+          ai = buildAI(currentKey());
+          console.warn(`[KEY ROTATE] مفتاح #${_keyIndex+1} منتهٍ → تبديل تلقائي | متبقٍ: ${available.length-1} مفتاح`);
+          // إعادة المحاولة بالمفتاح الجديد
+          const r2 = await ai.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: buildConfig(maxTokens, temp),
+          });
+          return (r2.text || '').trim();
+        }
+        // جميع المفاتيح منتهية
+        console.error('[QUOTA] جميع المفاتيح انتهت حصتها اليومية!');
+        throw new Error('⏳ انتهت حصة جميع مفاتيح API اليوم.\nستتجدد تلقائياً في منتصف الليل (UTC).');
+      }
+      if (isQuota) {
+        console.error('[QUOTA] انتهت الحصة اليومية للمفتاح!');
+        throw new Error('⏳ انتهت حصة مفتاح API اليومية المجانية.\nستتجدد في منتصف الليل (UTC).\n💡 أضف مفاتيح إضافية في GEMINI_KEYS_VPS للتبديل التلقائي.');
+      }
+      // تجاوز معدل مؤقت — انتظر وأعد المحاولة مرة واحدة
       console.warn('[RATE LIMIT] انتظار 20 ثانية...');
       await sleep(20000);
       const r2 = await ai.models.generateContent({
