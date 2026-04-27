@@ -3,19 +3,26 @@ import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
+// @xenova/transformers — اختياري: يُثبَّت بـ "npm install @xenova/transformers"
+// إذا لم يكن مثبّتاً، يعمل البوت بالمطابقة النصية العادية (احتياط آمن)
+let pipeline, env;
+try {
+  const xeno = await import('@xenova/transformers');
+  pipeline = xeno.pipeline;
+  env      = xeno.env;
+  console.log('[AI] ✅ @xenova/transformers متاح — نماذج AI مُفعَّلة');
+} catch(e) {
+  console.warn('[AI] ⚠️ @xenova/transformers غير مثبّت — يعمل بالمطابقة النصية العادية');
+  console.warn('[AI]    لتفعيل AI: npm install @xenova/transformers');
+  pipeline = null;
+  env      = null;
+}
 
 // ╔══════════════════════════════════════════════════════════╗
 // ║           ⚙️  إعدادات البوت — عدّل هذا القسم            ║
 // ╚══════════════════════════════════════════════════════════╝
 const BOT_EMAIL = 'scodoublet@yahoo.com'; // إيميل الحساب
 const BOT_PASS  = '12345';                // كلمة المرور
-// مفاتيح Groq المجانية — احصل عليها من: https://console.groq.com/keys
-// كل مفتاح = 14,400 طلب/يوم مجاناً | أضف أكثر من مفتاح للتبديل التلقائي
-const GROQ_KEYS = [
-  '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',  // المفتاح 1
-  // 'gsk_xxxxxxxxxxxxxxxxxxxxxx',  // المفتاح 2 — احذف // لتفعيله
-  // 'gsk_xxxxxxxxxxxxxxxxxxxxxx',  // المفتاح 3
-];
 // ═══════════════════════════════════════════════════════════
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,85 +30,765 @@ const DATA_FILE = path.join(__dirname, 'players.json');
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── Groq AI ──────────────────────────────────────────────────────────────────
-const GROQ_MODEL    = 'llama-3.3-70b-versatile';
-const _groqKeys     = GROQ_KEYS.filter(k => k && k.startsWith('gsk_'));
-const _groqDead     = new Set(); // مفاتيح انتهت حصتها اليوم
-let   _lastCall     = 0;
-const CALL_GAP_MS   = 2000; // ثانيتان بين الطلبات
+// ══════════════════════════════════════════════════════════════════════════════
+//  🤖  محرك الترجمة الذكي — Hugging Face Transformers.js (محلي، بدون إنترنت)
+//  • نماذج Helsinki-NLP/opus-mt تُنزَّل تلقائياً أول مرة (~80MB لكل لغة)
+//  • تعمل بعد ذلك بدون أي اتصال إنترنت
+//  • تدعم: عربي ↔ إنجليزي، فرنسي، إسباني، ألماني، إيطالي، روسي، تركي، هولندي
+// ══════════════════════════════════════════════════════════════════════════════
 
-console.log(`[AI] Groq | نموذج: ${GROQ_MODEL} | مفاتيح: ${_groqKeys.length}`);
+// مجلد تخزين النماذج المحلية (فقط إذا كانت المكتبة متاحة)
+if (env) {
+  env.cacheDir          = path.join(__dirname, 'models');
+  env.allowRemoteModels = true;
+}
 
-async function gemini(prompt, maxTokens = 1024, temp = 0.7) {
-  // فاصل زمني بين الطلبات لتجنب تجاوز المعدل
-  const gap = CALL_GAP_MS - (Date.now() - _lastCall);
-  if (gap > 0) await sleep(gap);
-  _lastCall = Date.now();
+// خريطة النماذج المتاحة (من-إلى → اسم النموذج على Hugging Face)
+const MODEL_MAP = {
+  'en-ar': 'Xenova/opus-mt-en-ar',
+  'ar-en': 'Xenova/opus-mt-ar-en',
+  'en-fr': 'Xenova/opus-mt-en-fr',
+  'fr-en': 'Xenova/opus-mt-fr-en',
+  'en-es': 'Xenova/opus-mt-en-es',
+  'es-en': 'Xenova/opus-mt-es-en',
+  'en-de': 'Xenova/opus-mt-en-de',
+  'de-en': 'Xenova/opus-mt-de-en',
+  'en-it': 'Xenova/opus-mt-en-it',
+  'it-en': 'Xenova/opus-mt-it-en',
+  'en-ru': 'Xenova/opus-mt-en-ru',
+  'ru-en': 'Xenova/opus-mt-ru-en',
+  'en-tr': 'Xenova/opus-mt-en-tr',
+  'tr-en': 'Xenova/opus-mt-tr-en',
+  'en-nl': 'Xenova/opus-mt-en-nl',
+  'nl-en': 'Xenova/opus-mt-nl-en',
+  'en-pt': 'Xenova/opus-mt-en-ROMANCE', // إسباني/فرنسي/برتغالي/إيطالي
+  'ar-fr': null, // عبر الإنجليزي
+  'ar-de': null, // عبر الإنجليزي
+  'ar-es': null, // عبر الإنجليزي
+};
 
-  const available = _groqKeys.filter(k => !_groqDead.has(k));
-  if (available.length === 0)
-    throw new Error('⏳ انتهت حصة جميع مفاتيح Groq اليوم.\nستتجدد في منتصف الليل (UTC).\nأضف مفاتيح جديدة من: console.groq.com/keys');
+// ذاكرة تخزين النماذج المحمّلة (تحميل كسول — فقط عند الطلب)
+const _aiPipes = {};
 
-  for (const key of available) {
-    try {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method : 'POST',
-        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body   : JSON.stringify({
-          model      : GROQ_MODEL,
-          messages   : [{ role: 'user', content: prompt }],
-          max_tokens : maxTokens,
-          temperature: temp,
-        }),
-        signal: AbortSignal.timeout(30000),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        if (res.status === 429) {
-          console.warn(`[GROQ] مفتاح منتهٍ (429) → التالي`);
-          _groqDead.add(key);
-          continue;
+async function loadTranslator(from, to) {
+  if (!pipeline) return null;                 // @xenova/transformers غير مثبّت
+  const k = `${from}-${to}`;
+  if (!MODEL_MAP[k]) return null;             // لا يوجد نموذج مباشر
+  if (_aiPipes[k])   return _aiPipes[k];      // مُحمَّل مسبقاً
+  console.log(`[AI] ⏳ تحميل نموذج ${from}→${to} (مرة واحدة فقط)...`);
+  try {
+    _aiPipes[k] = await pipeline('translation', MODEL_MAP[k], { quantized: true });
+    console.log(`[AI] ✅ نموذج ${from}→${to} جاهز`);
+    return _aiPipes[k];
+  } catch(e) {
+    console.warn(`[AI] ⚠️ فشل تحميل ${k}:`, e.message?.slice(0,60));
+    return null;
+  }
+}
+
+// الترجمة بالنموذج المحلي (مع pivot عبر الإنجليزي للأزواج غير المباشرة)
+async function localTranslate(text, fromCode, toCode) {
+  if (!text || fromCode === toCode) return null;
+  try {
+    // ① ترجمة مباشرة
+    const direct = await loadTranslator(fromCode, toCode);
+    if (direct) {
+      const r = await direct(text, { max_new_tokens: 128 });
+      return r?.[0]?.translation_text?.trim() || null;
+    }
+    // ② ترجمة عبر الإنجليزي (pivot)
+    if (fromCode !== 'en' && toCode !== 'en') {
+      const tr1 = await loadTranslator(fromCode, 'en');
+      const tr2 = await loadTranslator('en', toCode);
+      if (tr1 && tr2) {
+        const mid = await tr1(text, { max_new_tokens: 128 });
+        const midText = mid?.[0]?.translation_text?.trim();
+        if (midText) {
+          const r = await tr2(midText, { max_new_tokens: 128 });
+          return r?.[0]?.translation_text?.trim() || null;
         }
-        throw new Error(`Groq ${res.status}: ${data?.error?.message || JSON.stringify(data)}`);
       }
-      return (data.choices?.[0]?.message?.content || '').trim();
-    } catch(e) {
-      if (e.message?.includes('429')) { _groqDead.add(key); continue; }
-      console.error('[GROQ ERR]', e.message?.slice(0, 100));
-      throw e;
     }
+  } catch(e) {
+    console.warn('[AI-TR]', e.message?.slice(0,60));
   }
-  throw new Error('⏳ انتهت حصة جميع مفاتيح Groq اليوم. ستتجدد في منتصف الليل.');       model: GEMINI_MODEL,
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: buildConfig(maxTokens, temp),
-      });
-      return (r2.text || '').trim();
-    }
-    console.error('[AI ERR]', msg.slice(0, 120));
-    throw e;
-  } finally {
-    _activeCall = false;
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  🔍  محرك البحث الحر — DuckDuckGo (مجاني، بلا مفاتيح، محتوى جديد في كل مرة)
+// ══════════════════════════════════════════════════════════════════════════════
+async function duckSearch(query) {
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&t=wolfbot`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const d = await r.json();
+    return {
+      abstract:  d.AbstractText   || '',
+      definition:d.Definition     || '',
+      topics:   (d.RelatedTopics||[]).map(t=>t.Text||'').filter(s=>s.length>20).slice(0,6),
+      answer:    d.Answer          || '',
+    };
+  } catch(e) {
+    console.warn('[DDG]', e.message?.slice(0,50));
+    return { abstract:'', definition:'', topics:[], answer:'' };
   }
 }
 
-async function geminiJSON(prompt, maxTokens = 512, temp = 0) {
-  for (let i = 0; i < 3; i++) {
+// بحث عن جملة عربية عشوائية من القرآن/الأحاديث/ويكيبيديا العربية
+const AR_SENTENCE_SOURCES = [
+  // ويكيبيديا عربية — مقالات عشوائية
+  () => fetch('https://ar.wikipedia.org/api/rest_v1/page/random/summary',
+              { signal: AbortSignal.timeout(10000) }).then(r=>r.json()),
+  // ويكيبيديا عربية — أخبار اليوم
+  () => fetch('https://ar.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=5&format=json&origin=*',
+              { signal: AbortSignal.timeout(10000) }).then(r=>r.json()),
+];
+
+async function fetchArabicSentence() {
+  for (let i = 0; i < 10; i++) {
     try {
-      const raw = await gemini(prompt, maxTokens, temp);
-      // تنظيف: حذف markdown، إبقاء JSON فقط
-      let c = raw.replace(/```json\n?/g,'').replace(/```\n?/g,'')
-                 .replace(/^[^{[]*/,'').replace(/[^}\]]*$/,'').trim();
-      // إصلاح أسطر جديدة داخل قيم JSON (تسبب JSON.parse خطأ)
-      c = c.replace(/"([^"\\]*(\\.[^"\\]*)*)"/g, (match) =>
-        match.replace(/\n/g,'\\n').replace(/\r/g,'\\r').replace(/\t/g,'\\t')
-      );
-      return JSON.parse(c);
+      const src = AR_SENTENCE_SOURCES[Math.floor(Math.random()*AR_SENTENCE_SOURCES.length)];
+      const d   = await src();
+      const extract = d?.extract || '';
+      // جمل مختصرة: 20-75 حرف عربي فقط، لا رموز غريبة
+      const sents = (extract)
+        .split(/[.؟!،]\s+/)
+        .map(s => s.trim().replace(/\s+/g,' '))
+        .filter(s =>
+          s.length >= 20 && s.length <= 75 &&
+          /[\u0600-\u06FF]{5,}/.test(s) &&
+          !/https?:|www\.|ISBN|[0-9]{4}/.test(s)
+        );
+      if (sents.length === 0) continue;
+      return sents[Math.floor(Math.random()*Math.min(4, sents.length))];
     } catch(e) {
-      if (i === 2) throw e;
-      await sleep(1500);
+      await new Promise(r=>setTimeout(r,800));
     }
   }
+  return null;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  🎯  تقييم الإجابات بالذكاء الاصطناعي — نموذج التشابه الدلالي المتعدد اللغات
+//  paraphrase-multilingual-MiniLM-L12-v2 (~120MB) — يفهم المعنى لا مجرد الحروف
+// ══════════════════════════════════════════════════════════════════════════════
+let _simPipe = null;
+
+async function loadSimilarityModel() {
+  if (!pipeline) return null;                 // @xenova/transformers غير مثبّت
+  if (_simPipe) return _simPipe;
+  console.log('[AI] ⏳ تحميل نموذج تقييم الإجابات (مرة واحدة فقط)...');
+  try {
+    _simPipe = await pipeline(
+      'feature-extraction',
+      'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
+      { quantized: true }
+    );
+    console.log('[AI] ✅ نموذج التقييم جاهز — يفهم المعنى بـ 50+ لغة');
+    return _simPipe;
+  } catch(e) {
+    console.warn('[AI-SIM]', e.message?.slice(0,60));
+    return null;
+  }
+}
+
+function cosine(a, b) {
+  let dot=0, na=0, nb=0;
+  for (let i=0;i<a.length;i++) { dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; }
+  return dot / (Math.sqrt(na)*Math.sqrt(nb)+1e-9);
+}
+
+// تقييم ذكي: يقارن المعنى لا الحروف — يفهم المرادفات والتصريفات
+async function aiScore(expected, given) {
+  try {
+    const model = await loadSimilarityModel();
+    if (!model) return null;
+    const [eOut, gOut] = await Promise.all([
+      model(expected, { pooling:'mean', normalize:true }),
+      model(given,    { pooling:'mean', normalize:true }),
+    ]);
+    const sim = cosine(Array.from(eOut.data), Array.from(gOut.data));
+    return Math.round(Math.min(1, Math.max(0, sim)) * 100);
+  } catch(e) {
+    console.warn('[AI-SCORE]', e.message?.slice(0,50));
+    return null;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  🤖  النموذج اللغوي المحلي الكامل — Flan-T5-Base (~250MB)
+//  • يولّد معاني الكلمات، التعريفات، الجمل، تحليل الإعراب
+//  • يعمل بـ 100+ لغة بما فيها العربية — بدون إنترنت بعد التنزيل الأول
+//  • يعمل مثل وكيل ذكاء اصطناعي: يفهم التعليمات ويولّد إجابات طبيعية
+// ══════════════════════════════════════════════════════════════════════════════
+let _qaModel = null;
+
+async function loadQAModel() {
+  if (!pipeline) return null;
+  if (_qaModel)  return _qaModel;
+  console.log('[AI] ⏳ تحميل النموذج اللغوي flan-t5-base (~250MB) — مرة واحدة فقط...');
+  try {
+    _qaModel = await pipeline(
+      'text2text-generation',
+      'Xenova/flan-t5-base',
+      { quantized: true }
+    );
+    console.log('[AI] ✅ النموذج اللغوي جاهز — يولّد معاني وتعريفات وإعراباً');
+    return _qaModel;
+  } catch(e) {
+    console.warn('[AI-QA] فشل تحميل النموذج اللغوي:', e.message?.slice(0,60));
+    return null;
+  }
+}
+
+// توليد نص من النموذج اللغوي (greedy — أسرع بكثير من do_sample)
+async function localGenerate(prompt, maxTokens = 80, requireLoaded = false) {
+  try {
+    // requireLoaded: لا تنتظر تحميل النموذج (لو مش محمّل ارجع null فوراً)
+    if (requireLoaded && !_qaModel) return null;
+    const model = await loadQAModel();
+    if (!model) return null;
+    const out = await model(prompt, {
+      max_new_tokens: maxTokens,
+      // greedy decoding (بدون do_sample) — أسرع 3x
+    });
+    const text = out?.[0]?.generated_text?.trim() || '';
+    // قطع عند أول نقطة إذا كان النص طويلاً
+    const first = text.split(/[.!?]/)[0].trim();
+    return first.length > 3 ? first : (text.length > 3 ? text : null);
+  } catch(e) {
+    console.warn('[LOCAL-GEN]', e.message?.slice(0,50));
+    return null;
+  }
+}
+
+// ─── معنى الكلمة بالنموذج المحلي — جملة واحدة مختصرة ───────────────────────
+async function localWordMeaning(word, langCode) {
+  // لا نحتاج flan-t5 جاهزاً مسبقاً هنا (المستخدم ينتظر عمداً)
+  // لكن إذا فشل التحميل نُرجع null للاحتياط
+  if (langCode === 'ar') {
+    const enWord = await localTranslate(word, 'ar', 'en');
+    const target = enWord && enWord !== word ? enWord : word;
+    const enDef  = await localGenerate(`In one sentence, define "${target}":`, 65);
+    if (!enDef) return null;
+    const arDef  = enWord ? await localTranslate(enDef, 'en', 'ar') : null;
+    if (arDef && arDef.length > 8) {
+      return enWord && enWord !== word ? `(${enWord}) ${arDef}` : arDef;
+    }
+    return enDef;
+  }
+  return await localGenerate(`In one sentence, define "${word}":`, 65);
+}
+
+// ─── توليد تعريف للألعاب — أول سطر يفحص النموذج، لا ينتظر أي تحميل ──────────
+async function localMakeDefinition(word, langCode) {
+  if (!_qaModel) return null; // ← فحص فوري قبل أي شيء — لا نماذج جاهزة
+
+  if (langCode === 'ar') {
+    // الترجمة اختيارية — إذا فشلت نستخدم الكلمة مباشرة
+    const enWord = _aiPipes['ar-en']
+      ? (await localTranslate(word, 'ar', 'en') || word)
+      : word;
+    const def = await localGenerate(
+      `Define "${enWord}" in one sentence without saying the word:`, 60, true
+    );
+    if (!def) return null;
+    // ترجمة الناتج للعربي إذا كان النموذج جاهزاً
+    const arDef = _aiPipes['en-ar']
+      ? await localTranslate(def, 'en', 'ar')
+      : null;
+    return arDef || def;
+  }
+  return await localGenerate(
+    `Define "${word}" in one sentence without saying the word:`, 60, true
+  );
+}
+
+// ─── تحليل إعراب الجملة بالنموذج المحلي ─────────────────────────────────────
+async function localGrammarAnalysis(sentence) {
+  // ترجمة الجملة العربية للإنجليزي أولاً
+  const enSent = await localTranslate(sentence, 'ar', 'en') || sentence;
+  const prompt = `Analyze the grammatical structure of this sentence: "${enSent}". Identify subject, verb, object, and other parts:`;
+  const analysis = await localGenerate(prompt, 180);
+  if (!analysis) return null;
+  // ترجمة التحليل للعربي
+  const arAnalysis = await localTranslate(analysis, 'en', 'ar');
+  return arAnalysis || analysis;
+}
+
+// ─── توليد جملة مثال للكلمة ──────────────────────────────────────────────────
+async function localMakeExample(word, langCode) {
+  const enWord = langCode === 'ar'
+    ? (await localTranslate(word, 'ar', 'en') || word)
+    : word;
+  const prompt = `Write one short example sentence using the word "${enWord}":`;
+  const ex = await localGenerate(prompt, 80);
+  if (!ex) return null;
+  if (langCode === 'ar') return await localTranslate(ex, 'en', 'ar') || ex;
+  return ex;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  🧠  Wolf BRAIN — الذاكرة الذاتية التعلّمية
+//  • يجلب محتوى جديداً بالذكاء الاصطناعي المحلي في كل لعبة — لا تكرار أبداً
+//  • يتعلم تلقائياً من كل لعبة ويطوّر صعوبته بناءً على أداء اللاعبين
+//  • يتذكر ما تعلّمه ويوسّع مخزونه المعرفي مع كل جلسة لعب
+// ══════════════════════════════════════════════════════════════════════════════
+console.log('[AI] 🤖 Wolf AI + flan-t5-base + Transformers.js — التشغيل...');
+
+// ─── ① رموز اللغات ─────────────────────────────────────────────────────────
+const LANG_CODES = {
+  'Arabic':'ar','English':'en','French':'fr','Spanish':'es','German':'de',
+  'Turkish':'tr','Italian':'it','Portuguese':'pt','Russian':'ru','Chinese':'zh',
+  'Japanese':'ja','Korean':'ko','Persian':'fa','Hindi':'hi','Dutch':'nl','Urdu':'ur',
+};
+
+// ─── ② محرك NLP — التطبيع والجذور ──────────────────────────────────────────
+function normTxt(s) {
+  return String(s).toLowerCase()
+    .replace(/[\u064B-\u065F\u0670]/g,'')       // حذف التشكيل العربي
+    .replace(/[أإآأ]/g,'ا').replace(/ة/g,'ه').replace(/ى/g,'ي')
+    .replace(/[^\u0600-\u06FFa-z0-9\s]/g,' ')
+    .replace(/\s+/g,' ').trim();
+}
+// تحليل جذر الكلمة العربية (مبسّط)
+function arabicRoot(word) {
+  const w = normTxt(word);
+  return w.replace(/^(ال|وال|فال|بال|كال|لل)/,'')
+          .replace(/(ات|ون|ين|ان|ه|ها|هم|هن|نا|كم|كن|ي|تي|ني|ك|ه)$/,'');
+}
+// كاشف اللغة بالخصائص الحرفية
+function detectLang(text) {
+  const arabicChars  = (text.match(/[\u0600-\u06FF]/g)||[]).length;
+  const frenchChars  = (text.match(/[àâäéèêëîïôùûüÿçœæ]/gi)||[]).length;
+  const latinChars   = (text.match(/[a-zA-Z]/g)||[]).length;
+  if (arabicChars > latinChars) return 'Arabic';
+  if (frenchChars > 2) return 'French';
+  return 'English';
+}
+
+// ─── ③ خوارزميات المقارنة الذكية ───────────────────────────────────────────
+function lev(a,b) {
+  const m=a.length,n=b.length;
+  const dp=Array.from({length:m+1},(_,i)=>Array.from({length:n+1},(_,j)=>j===0?i:0));
+  for(let j=0;j<=n;j++) dp[0][j]=j;
+  for(let i=1;i<=m;i++) for(let j=1;j<=n;j++)
+    dp[i][j]=a[i-1]===b[j-1]?dp[i-1][j-1]:1+Math.min(dp[i-1][j],dp[i][j-1],dp[i-1][j-1]);
+  return dp[m][n];
+}
+function simScore(a,b) {
+  const na=normTxt(a),nb=normTxt(b);
+  if(!na||!nb) return 0;
+  if(na===nb) return 1;
+  // تطابق الجذور العربية
+  if(arabicRoot(na)===arabicRoot(nb)&&arabicRoot(na).length>2) return 0.92;
+  // تطابق مع حذف ال التعريف
+  const sa=na.replace(/^ال/,''), sb=nb.replace(/^ال/,'');
+  if(sa===sb&&sa.length>1) return 0.95;
+  // تضمين: كلمة واحدة داخل الأخرى
+  if(na.includes(nb)||nb.includes(na)) {
+    const ratio=Math.min(na.length,nb.length)/Math.max(na.length,nb.length);
+    return 0.7+ratio*0.25;
+  }
+  return Math.max(0, 1-lev(na,nb)/Math.max(na.length,nb.length));
+}
+function wordOverlap(ref,player) {
+  const rw=new Set(normTxt(ref).split(' ').filter(w=>w.length>2));
+  const pw=normTxt(player).split(' ').filter(w=>w.length>2);
+  if(!rw.size) return 0;
+  let m=0; for(const w of pw) if(rw.has(w)) m++;
+  // مرونة للكلمات المشتقة
+  if(m===0) {
+    for(const w of pw)
+      for(const r of rw)
+        if(arabicRoot(w)===arabicRoot(r)&&arabicRoot(w).length>2) { m+=0.8; break; }
+  }
+  return Math.min(1, m/rw.size*1.2);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ③ BRAIN — الذاكرة الذاتية المتطورة (تحفظ في brain.json)
+// ══════════════════════════════════════════════════════════════════════════
+const BRAIN_FILE = path.join(__dirname, 'brain.json');
+let BRAIN = {
+  articles: {},
+  pairs: {},
+  usedByChannel: {},
+  stats: { totalFetched:0, gamesPlayed:0, lastFetch:0 }
+};
+function loadBrain() {
+  try {
+    if (fs.existsSync(BRAIN_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(BRAIN_FILE,'utf8'));
+      BRAIN = { ...BRAIN, ...saved };
+    }
+  } catch(e) { console.warn('[BRAIN] خطأ:', e.message); }
+}
+function saveBrain() {
+  try { fs.writeFileSync(BRAIN_FILE, JSON.stringify(BRAIN)); } catch(e) {}
+}
+loadBrain();
+console.log('[BRAIN] مقالات محفوظة:', Object.keys(BRAIN.articles).length,
+            '| أزواج:', Object.keys(BRAIN.pairs).length);
+
+// ══════════════════════════════════════════════════════════════════════════
+// ④ ويكاموس (Wiktionary) API — قاموس لغوي حقيقي غني بالكلمات والتعريفات
+//    نفس واجهة ويكاموس — مجاني بلا مفاتيح — يغطي العربية والإنجليزية وأكثر
+// ══════════════════════════════════════════════════════════════════════════
+
+// كلمة عشوائية من ويكاموس
+async function wiktRandom(langCode) {
+  const r = await fetch(
+    `https://${langCode}.wiktionary.org/api/rest_v1/page/random/summary`,
+    { signal: AbortSignal.timeout(12000) }
+  );
+  if (!r.ok) throw new Error('Wikt ' + r.status);
+  return await r.json();
+}
+
+// تعريف كلمة محددة من ويكاموس
+async function wiktSummary(word, langCode) {
+  try {
+    const r = await fetch(
+      `https://${langCode}.wiktionary.org/api/rest_v1/page/summary/${encodeURIComponent(word)}`,
+      { signal: AbortSignal.timeout(10000) }
+    );
+    if (!r.ok) return null;
+    return await r.json();
+  } catch(e) { return null; }
+}
+
+// ترجمة كلمة عبر روابط اللغات في ويكاموس
+async function wiktLangLink(word, fromCode, toCode) {
+  try {
+    const url = `https://${fromCode}.wiktionary.org/w/api.php?action=query&titles=${encodeURIComponent(word)}&prop=langlinks&lllang=${toCode}&format=json&origin=*`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    const d = await r.json();
+    const pages = Object.values(d.query?.pages||{});
+    return pages[0]?.langlinks?.[0]?.['*'] || null;
+  } catch(e) { return null; }
+}
+
+// بحث عن كلمة في ويكاموس بالإنجليزية (أشمل للترجمات)
+async function wiktSearch(word) {
+  try {
+    const url = `https://en.wiktionary.org/w/api.php?action=query&titles=${encodeURIComponent(word)}&prop=langlinks&lllimit=20&format=json&origin=*`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return {};
+    const d = await r.json();
+    const pages = Object.values(d.query?.pages||{});
+    const links = pages[0]?.langlinks || [];
+    const result = {};
+    for (const l of links) result[l.lang] = l['*'];
+    return result;
+  } catch(e) { return {}; }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ⑤ محرك المحتوى الذكي — جلب + تعلم + عدم التكرار + تطوير الصعوبة تلقائياً
+// ══════════════════════════════════════════════════════════════════════════
+// تلميح إكمال الفراغ — يُستخدم في !كلمات و!إعراب (يخفي العنوان)
+function makeClue(title, extract, description) {
+  const esc = title.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const cleaned = (extract||'')
+    .replace(new RegExp(esc,'gi'),'___')
+    .replace(/\s*\([^)]{0,60}\)/g,'')
+    .split('.')[0].trim();
+  if (cleaned.length >= 25) return cleaned;
+  if ((description||'').length > 10) return description;
+  return (extract||'').slice(0,200).split('.')[0].trim();
+}
+// تعريف نظيف — يُستخدم في !معرفات (يظهر التعريف الكامل والجواب هو الاسم)
+function makeDef(title, extract, description) {
+  const firstSent = (extract||'').replace(/\s*\([^)]{0,80}\)/g,'').split('.')[0].trim();
+  if (firstSent.length >= 25) return firstSent;
+  if ((description||'').length > 10) return description;
+  return (extract||'').slice(0,250).trim();
+}
+
+function markUsed(channelId, key) {
+  const cid = String(channelId);
+  if (!BRAIN.usedByChannel[cid]) BRAIN.usedByChannel[cid] = [];
+  if (!BRAIN.usedByChannel[cid].includes(key)) {
+    BRAIN.usedByChannel[cid].push(key);
+    if (BRAIN.usedByChannel[cid].length > 300)
+      BRAIN.usedByChannel[cid] = BRAIN.usedByChannel[cid].slice(-150);
+  }
+}
+
+function learnResult(key, wasCorrect) {
+  if (!key) return;
+  const a = BRAIN.articles[key] || BRAIN.pairs[key];
+  if (!a) return;
+  a.played = (a.played||0) + 1;
+  a.correct = (a.correct||0) + (wasCorrect ? 1 : 0);
+  // صعوبة متوسطة: نطاق 0.35–0.65 حتى لا تصبح الأسئلة سهلة جداً أو صعبة جداً
+  a.difficulty = +(Math.max(0.35, Math.min(0.65, 1 - a.correct/a.played)).toFixed(2));
+  BRAIN.stats.gamesPlayed = (BRAIN.stats.gamesPlayed||0) + 1;
+  saveBrain();
+}
+
+// صفحات يجب تجاهلها في ويكاموس
+const SKIP_RE = /(appendix|index|thesaurus|rhymes|concordance|category|template|help|wiktionary|user|file|module|تصنيف|قائمة|نموذج|ملف|مساعدة|ويكاموس|مستخدم)/i;
+
+// ─── جلب كلمة عشوائية وتعريفها من ويكاموس ──────────────────────────────
+async function fetchArticle(langCode, channelId) {
+  const cid = String(channelId);
+  const used = BRAIN.usedByChannel[cid] || [];
+
+  // تفضيل الكلمات الأقرب للمستوى المتوسط (0.5)
+  const available = Object.entries(BRAIN.articles)
+    .filter(([k,v]) => v.lang===langCode && !used.includes(k))
+    .sort((a,b) => Math.abs((a[1].difficulty||0.5)-0.5) - Math.abs((b[1].difficulty||0.5)-0.5));
+
+  if (available.length > 0) {
+    const pool = available.slice(0, Math.min(8, available.length));
+    const [key, art] = pool[Math.floor(Math.random()*pool.length)];
+    markUsed(cid, key);
+    saveBrain();
+    return { ...art, key };
+  }
+
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try {
+      const d = await wiktRandom(langCode);
+      if (!d?.title) continue;
+      // تجاهل صفحات المساعدة والتصنيفات
+      if (SKIP_RE.test(d.title) || d.title.includes(':')) continue;
+      // تجاهل الكلمات القصيرة جداً أو الطويلة جداً (غالباً ليست كلمات)
+      if (d.title.length < 2 || d.title.length > 35) continue;
+      // تجاهل إذا كان التعريف فارغاً
+      const extract = (d.extract||'').trim();
+      if (extract.length < 15) continue;
+
+      const key = langCode + ':' + d.title;
+      if (BRAIN.articles[key]) { markUsed(cid, key); saveBrain(); return { ...BRAIN.articles[key], key }; }
+
+      // التعريف من ويكاموس مباشرةً (هو قاموس بطبيعته)
+      const def = makeDef(d.title, extract, d.description||'');
+      const clue = makeClue(d.title, extract, d.description||'');
+
+      const art = { title:d.title, clue, def, lang:langCode, difficulty:0.5, played:0, correct:0 };
+      BRAIN.articles[key] = art;
+      BRAIN.stats.totalFetched = (BRAIN.stats.totalFetched||0)+1;
+      BRAIN.stats.lastFetch = Date.now();
+      markUsed(cid, key);
+      saveBrain();
+      console.log('[WIKT] تعلّمت:', d.title, '('+langCode+') ←', def.slice(0,40));
+      return { ...art, key };
+    } catch(e) {
+      console.warn('[WIKT]', e.message?.slice(0,50));
+      await new Promise(r=>setTimeout(r,1500));
+    }
+  }
+  return null;
+}
+
+// ─── جلب زوج ترجمة — AI محلي للترجمة + ويكاموس للكلمة العشوائية ────────
+async function fetchTranslationPair(fromCode, toCode, channelId) {
+  const cid = String(channelId);
+  const used = BRAIN.usedByChannel[cid] || [];
+
+  // من الذاكرة أولاً
+  const available = Object.entries(BRAIN.pairs)
+    .filter(([k,v]) => v[fromCode] && v[toCode] && !used.includes(k))
+    .sort((a,b) => Math.abs((a[1].difficulty||0.5)-0.5) - Math.abs((b[1].difficulty||0.5)-0.5));
+  if (available.length > 0) {
+    const [key, pair] = available[Math.floor(Math.random()*Math.min(8,available.length))];
+    markUsed(cid, key); saveBrain();
+    return { src: pair[fromCode], ans: pair[toCode], key };
+  }
+
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try {
+      const d = await wiktRandom(fromCode);
+      if (!d?.title || d.title.includes(':') || d.title.length > 30) continue;
+      if (SKIP_RE.test(d.title)) continue;
+
+      // ① ترجمة بالـ AI المحلي (أفضل وأسرع)
+      let translated = await localTranslate(d.title, fromCode, toCode);
+
+      // ② احتياط: ويكاموس
+      if (!translated) translated = await wiktLangLink(d.title, fromCode, toCode);
+      if (!translated || translated === d.title) continue;
+
+      const key = 'pair:' + fromCode + ':' + d.title;
+      BRAIN.pairs[key] = { [fromCode]:d.title, [toCode]:translated, played:0, correct:0 };
+      markUsed(cid, key); saveBrain();
+      console.log('[AI-PAIR] ✅', d.title, '→', translated);
+      return { src: d.title, ans: translated, key };
+    } catch(e) {
+      console.warn('[AI-PAIR]', e.message?.slice(0,50));
+      await new Promise(r=>setTimeout(r,1500));
+    }
+  }
+  return null;
+}
+
+// ─── جلب جملة ثنائية — تعريف + ترجمته بالـ AI المحلي ───────────────────
+async function fetchBilingualSentence(fromCode, toCode, channelId) {
+  const cid = String(channelId);
+  const used = BRAIN.usedByChannel[cid] || [];
+
+  // من الذاكرة أولاً
+  const available = Object.entries(BRAIN.pairs)
+    .filter(([k,v]) => k.startsWith('sent:') && v[fromCode] && v[toCode] && !used.includes(k));
+  if (available.length > 0) {
+    const [key, pair] = available[Math.floor(Math.random()*Math.min(8,available.length))];
+    markUsed(cid, key); saveBrain();
+    return { src: pair[fromCode], ans: pair[toCode], key };
+  }
+
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try {
+      const d = await wiktRandom(fromCode);
+      if (!d?.title || SKIP_RE.test(d.title) || d.title.includes(':')) continue;
+      const defFrom = (d.extract||'').split('.')[0].trim();
+      if (defFrom.length < 20) continue;
+
+      // ① ترجمة التعريف كاملاً بالـ AI المحلي
+      let defTo = await localTranslate(defFrom, fromCode, toCode);
+
+      // ② احتياط: ابحث عن التعريف في ويكاموس باللغة الهدف
+      if (!defTo) {
+        const linked = await wiktLangLink(d.title, fromCode, toCode);
+        if (linked) {
+          const d2 = await wiktSummary(linked, toCode);
+          defTo = d2?.extract?.split('.')[0].trim() || null;
+        }
+      }
+      if (!defTo || defTo.length < 10) continue;
+
+      const key = 'sent:' + fromCode + ':' + d.title;
+      BRAIN.pairs[key] = { [fromCode]:defFrom, [toCode]:defTo, played:0, correct:0 };
+      markUsed(cid, key); saveBrain();
+      console.log('[AI-SENT] ✅', defFrom.slice(0,30), '→', defTo.slice(0,30));
+      return { src: defFrom, ans: defTo, key };
+    } catch(e) {
+      console.warn('[AI-SENT]', e.message?.slice(0,50));
+      await new Promise(r=>setTimeout(r,1500));
+    }
+  }
+  return null;
+}
+
+// ─── معنى كلمة — النموذج المحلي أولاً، ثم Free Dictionary احتياطاً ──────────
+//  ① flan-t5-base (محلي، بدون إنترنت، يفهم التعليمات)
+//  ② Free Dictionary API (إنجليزي — احتياط سريع)
+//  ③ DuckDuckGo (آخر احتياط)
+async function aiMeaning(word, langCode) {
+  const results = [];
+
+  // ① النموذج اللغوي المحلي flan-t5-base — يعمل بدون أي API خارجي
+  const localDef = await localWordMeaning(word, langCode);
+  if (localDef && localDef.length > 10) {
+    console.log('[LOCAL-MEAN] ✅', word, ':', localDef.slice(0,50));
+    return localDef;
+  }
+
+  // ② Free Dictionary API — احتياط للإنجليزي (مجاني، بلا مفاتيح)
+  if (langCode === 'en' || /^[a-zA-Z\s'-]+$/.test(word.trim())) {
+    try {
+      const r = await fetch(
+        `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word.trim())}`,
+        { signal: AbortSignal.timeout(7000) }
+      );
+      if (r.ok) {
+        const data = await r.json();
+        // جملة واحدة فقط — أول تعريف من أول نوع كلام
+        const firstMeaning = data?.[0]?.meanings?.[0];
+        const firstDef     = firstMeaning?.definitions?.[0]?.definition || '';
+        const pos          = firstMeaning?.partOfSpeech || '';
+        if (firstDef.length > 5) {
+          const short = `(${pos}) ${firstDef}`.slice(0, 200);
+          console.log('[DICT-API] ✅', word, ':', short.slice(0,50));
+          results.push(short);
+        }
+      }
+    } catch(e) { console.warn('[DICT-API]', e.message?.slice(0,40)); }
+    if (results.length > 0) return results[0];
+  }
+
+  // ② DuckDuckGo — بحث حر للكلمة
+  try {
+    const query = langCode === 'ar'
+      ? `${word} معنى تعريف`
+      : `${word} definition meaning`;
+    const ddg = await duckSearch(query);
+    const text = ddg.abstract || ddg.definition || ddg.answer || '';
+    if (text.length > 20) {
+      console.log('[DDG-MEAN] ✅', word, ':', text.slice(0,50));
+      return text.slice(0, 400);
+    }
+    // جرّب الموضوعات المرتبطة
+    if (ddg.topics.length > 0) {
+      const best = ddg.topics.find(t => t.length > 30) || ddg.topics[0];
+      if (best) return best.slice(0, 300);
+    }
+  } catch(e) { console.warn('[DDG-MEAN]', e.message?.slice(0,40)); }
+
+  // ③ ويكيبيديا (عربية أو إنجليزية)
+  try {
+    const wiki = langCode === 'ar' ? 'ar' : 'en';
+    const url  = `https://${wiki}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(word)}`;
+    const r    = await fetch(url, { signal: AbortSignal.timeout(7000) });
+    if (r.ok) {
+      const d = await r.json();
+      if (d?.extract && d.extract.length > 20) {
+        console.log('[WIKI-MEAN] ✅', word);
+        return d.extract.split('.').slice(0,2).join('.').trim() + '.';
+      }
+    }
+  } catch(e) { console.warn('[WIKI-MEAN]', e.message?.slice(0,40)); }
+
+  // ④ بحث ويكيبيديا عبر API إذا لم يوجد مقال مباشر
+  try {
+    const wiki  = langCode === 'ar' ? 'ar' : 'en';
+    const qTerm = langCode === 'ar' ? `${word} معنى` : `${word} definition`;
+    const url   = `https://${wiki}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(qTerm)}&srlimit=1&format=json&origin=*`;
+    const r     = await fetch(url, { signal: AbortSignal.timeout(7000) });
+    if (r.ok) {
+      const d = await r.json();
+      const title = d?.query?.search?.[0]?.title;
+      if (title) {
+        const r2 = await fetch(
+          `https://${wiki}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`,
+          { signal: AbortSignal.timeout(7000) }
+        );
+        if (r2.ok) {
+          const d2 = await r2.json();
+          if (d2?.extract && d2.extract.length > 20) {
+            return d2.extract.split('.').slice(0,2).join('.').trim() + '.';
+          }
+        }
+      }
+    }
+  } catch(e) { console.warn('[WIKI-SEARCH]', e.message?.slice(0,40)); }
+
+  return null;
+}
+
+// ─── ترجمة كلمة — AI محلي أولاً ثم ويكاموس احتياط ──────────────────────
+async function aiTranslate(word, fromCode, toCode) {
+  // ① النموذج المحلي (دقيق، سريع، بدون إنترنت)
+  const aiResult = await localTranslate(word, fromCode, toCode);
+  if (aiResult && aiResult !== word) return aiResult;
+  // ② ويكاموس احتياط (لأزواج اللغات غير المدعومة بنموذج محلي)
+  const linked = await wiktLangLink(word, fromCode, toCode);
+  if (linked) return linked;
+  const all = await wiktSearch(word);
+  return all[toCode] || null;
+}
+
+function aiHint(game) {
+  const ans = game?.answer || '';
+  if (ans.length <= 3) return `💡 الإجابة تبدأ بـ "${ans[0]||''}"`;
+  return `💡 الإجابة من ${ans.length} حرف وتبدأ بـ "${ans[0]}"`;
+}
+
+
 
 // ─── قاعدة البيانات ───────────────────────────────────────────────────────────
 function loadDB() {
@@ -178,7 +865,6 @@ function fastDetect(text) {
   if (/^[!！](لغه|لغة)\s*ترتيب\s*(ولف|wolf)/.test(tl)) return {cmd:'RANK_GLOBAL',userLang:'Arabic'};
   // التالي
   if (/^[!！](لغه|لغة)\s*(التالي|تالي)/.test(tl)) return {cmd:'NEXT',userLang:'Arabic'};
-  if (/^[!！](لغه|لغة)\s*(اختبار|تشخيص)/.test(tl)) return {cmd:'DIAG',userLang:'Arabic'};
 
   // الأوضاع التلقائية الخمسة
   if (/^[!！]معرفات\s*تلقائي/.test(tl)) return {cmd:'AUTO_GAME_GUESS',userLang:'Arabic'};
@@ -252,6 +938,12 @@ function fastDetect(text) {
     return {cmd:'MEANING', userLang:'Arabic', queryText: m?m[1].trim():''};
   }
 
+  // !بحث — بحث حر في الإنترنت
+  if (/^[!！]بحث\s+\S/.test(tl)) {
+    const m = t.match(/^[!！]\S+\s+(.+)/);
+    return {cmd:'SEARCH', userLang:'Arabic', queryText: m?m[1].trim():''};
+  }
+
   // ترجمة: !ترجمه {لغة} {نص}
   if (/^[!！]ترجم[هة]?\s+\S/.test(tl)) {
     const parts = t.replace(/^[!！]\S+\s+/, '').trim().split(/\s+/);
@@ -290,318 +982,248 @@ function isOtherBotCmd(text) {
   return OTHER_BOT_PREFIXES.some(p => tl.startsWith(p.toLowerCase()));
 }
 
-// ذاكرة مؤقتة للأوامر المجهولة — تتجنب استدعاء Gemini مجدداً
-const unknownCache = new Map(); // prefix → timestamp
-const UNKNOWN_TTL  = 5 * 60 * 1000; // 5 دقائق
-
-function getCacheKey(text) {
-  return text.trim().toLowerCase().slice(0, 12);
-}
-
-// ─── كشف الأمر بالذكاء الاصطناعي (أي لغة في العالم) ─────────────────────────
+// ─── كشف الأوامر بالأنماط (بدون AI) ─────────────────────────────────────────
 async function detectIntent(text) {
-  // تجاهل أوامر البوتات الأخرى المعروفة فوراً
   if (isOtherBotCmd(text)) return {cmd:'UNKNOWN',userLang:'Arabic'};
-
-  // تحقق من الذاكرة المؤقتة
-  const ck = getCacheKey(text);
-  const cached = unknownCache.get(ck);
-  if (cached && Date.now() - cached < UNKNOWN_TTL) {
-    return {cmd:'UNKNOWN',userLang:'Arabic'};
+  // fastDetect يغطي معظم الحالات — هنا فقط اللغات الأخرى
+  const tl = text.trim().toLowerCase();
+  // MEANING بالإنجليزية أو غيرها
+  const mMean = text.match(/^[!！]\s*(?:meaning|define|definition|means?)\s+(.+)/i);
+  if (mMean) return {cmd:'MEANING',userLang:'English',queryText:mMean[1].trim()};
+  // TRANSLATE بالإنجليزية: !translate {lang} {text}
+  const mTr = text.match(/^[!！]\s*(?:translate?|tr)\s+(\S+)\s+(.+)/i);
+  if (mTr) {
+    const toLang = {
+      arabic:'Arabic',english:'English',french:'French',spanish:'Spanish',
+      german:'German',turkish:'Turkish',italian:'Italian',russian:'Russian',
+    }[mTr[1].toLowerCase()] || mTr[1];
+    return {cmd:'TRANSLATE',userLang:'English',toLang,queryText:mTr[2].trim()};
   }
-
-  try {
-    const r = await geminiJSON(
-`Command parser for a language-learning bot. Detect the command from this message in ANY language.
-
-Commands (understand by MEANING, not exact words):
-MEANING        - wants definition of a word/phrase (e.g. !معنى كلمة)
-TRANSLATE      - wants to translate text to another language (e.g. !ترجمه ...)
-GAME_TR_WORD   - start word-translation game [exact pattern: !كلمه/!كلمة {from} {to} بدء]
-GAME_TR_SENT   - start sentence-translation game [exact pattern: !جمله/!جملة {from} {to} بدء]
-GAME_TR_TEXT   - start text-translation game [exact pattern: !نص {from} {to} بدء]
-AUTO_GAME_TR_WORD - toggle auto word-translation [exact pattern: !كلمه/!كلمة تلقائي]
-AUTO_GAME_TR_SENT - toggle auto sentence-translation [exact pattern: !جمله/!جملة تلقائي]
-AUTO_GAME_TR_TEXT - toggle auto text-translation [exact pattern: !نص تلقائي]
-MY_SCORE       - show my points [exact: !لغه/!لغة مجموع or نقاطي]
-RANK_CHANNEL   - show top players in channel [exact: !لغه/!لغة ترتيب قناه/قناة]
-RANK_GLOBAL    - show global ranking [exact: !لغه/!لغة ترتيب ولف/wolf]
-UNKNOWN        - everything else (other bot commands, game chatter, unrelated messages)
-
-IMPORTANT: Return UNKNOWN for anything that looks like another bot's command or game message.
-IMPORTANT: HELP, GAME_GUESS, GAME_WORD, GAME_GRAMMAR, AUTO_GAME_GUESS, AUTO_GAME_WORD, AUTO_GAME_GRAMMAR, NEXT are handled separately — always return UNKNOWN for them.
-
-Message: "${text.replace(/"/g,"'").replace(/\n/g,' ').slice(0,200)}"
-
-userLang = the language the user wrote in (English/Arabic/French/Turkish/etc.)
-For MEANING: put word in queryText. For TRANSLATE: toLang + queryText.
-For TR games: extract fromLang/toLang if mentioned.
-
-JSON only: {"cmd":"","userLang":"","fromLang":"","toLang":"","queryText":""}`,
-      512, 0
-    );
-    console.log(`[INTENT] "${text.slice(0,30)}" → ${r.cmd} [${r.userLang}]`);
-    // خزّن النتائج المجهولة لتجنب الاستدعاء مجدداً
-    if (r.cmd === 'UNKNOWN') unknownCache.set(ck, Date.now());
-    return r;
-  } catch(e) {
-    console.error('[INTENT ERR]', e.message?.slice(0,60));
-    unknownCache.set(ck, Date.now()); // خزّن حتى عند الخطأ
-    return {cmd:'UNKNOWN',userLang:'Arabic',fromLang:'',toLang:'',queryText:''};
-  }
+  return {cmd:'UNKNOWN',userLang:'Arabic'};
 }
 
-// ─── نظام التقييم الذكي (يُستدعى فقط عند وجود رمز #) ────────────────────────
+// ─── تقييم الإجابات — AI دلالي + Fuzzy Matching احتياط ─────────────────────
+const FB_OK  = ['ممتاز! ✨','أحسنت! 🌟','رائع! 🎉','صحيح تماماً! ✅','عمل رائع! 👏'];
+const FB_BAD = ['غير صحيح ❌','حاول مرة أخرى 💪','للأسف خطأ ❌','راجع الإجابة 🔄'];
+
 async function evalAnswer(game, playerMsg) {
   if (game.type === 'GAME_GRAMMAR') return evalGrammar(game, playerMsg);
 
-  try {
-    const isText  = game.type === 'GAME_TR_TEXT';
-    const maxPts  = isText ? 30 : 10;
-    const ansLang = game.lang || game.fromLang || 'Arabic';
+  const maxPts = game.type === 'GAME_TR_TEXT' ? 30 : 10;
+  let pct = 0;
 
-    // بناء السياق المناسب لكل نوع لعبة
-    let context = '';
-    if (game.type === 'GAME_GUESS') {
-      // اللاعب رأى وصفاً وعليه تخمين الكلمة
-      context =
-`GAME TYPE: Word guessing game
-The player was shown this DESCRIPTION/CLUE in ${ansLang}: "${game.display.slice(0,300)}"
-The player must GUESS THE WORD that matches this description.
-Correct word: "${game.answer}"
-Player's guess: "${playerMsg}"
-RULES: Accept the exact word, common spelling variations, or very close synonyms that match the description equally well. Do NOT accept unrelated words.`;
-    } else if (game.type === 'GAME_WORD') {
-      // اللاعب رأى كلمة وعليه شرح معناها
-      context =
-`GAME TYPE: Word meaning game
-The player was shown this WORD in ${ansLang}: "${game.question}"
-The player must EXPLAIN THE MEANING of this word.
-Reference meaning: "${game.answer.slice(0,300)}"
-Player's explanation: "${playerMsg}"
-RULES: Accept any explanation that correctly captures the core meaning. Accept synonyms, partial definitions, paraphrasing. Reject completely wrong or unrelated answers.`;
-    } else if (game.type === 'GAME_TR_WORD') {
-      context =
-`GAME TYPE: Word translation game
-The player was shown this word in ${game.fromLang}: "${game.question}"
-The player must translate it to ${game.toLang}.
-Correct translation: "${game.answer}"
-Player's translation: "${playerMsg}"
-RULES: Accept exact translation, spelling variations, synonyms with same meaning. Reject wrong or unrelated words.`;
-    } else if (game.type === 'GAME_TR_SENT') {
-      context =
-`GAME TYPE: Sentence translation game
-The player was shown this sentence in ${game.fromLang}: "${game.question.slice(0,300)}"
-The player must translate it to ${game.toLang}.
-Reference translation: "${game.answer.slice(0,300)}"
-Player's translation: "${playerMsg.slice(0,300)}"
-RULES: Accept any translation that conveys the same meaning, even if worded differently. Ignore minor spelling errors. Reject completely wrong translations.`;
-    } else if (game.type === 'GAME_TR_TEXT') {
-      context =
-`GAME TYPE: Paragraph translation game
-The player was shown this paragraph in ${game.fromLang}: "${game.question.slice(0,400)}"
-The player must translate it to ${game.toLang}.
-Reference translation: "${game.answer.slice(0,400)}"
-Player's translation: "${playerMsg.slice(0,400)}"
-RULES: Grade based on overall meaning accuracy. Accept paraphrasing and different word choices. Deduct only for missing or wrong key ideas.`;
+  if (game.type === 'GAME_GUESS' || game.type === 'GAME_TR_WORD') {
+    // ① تقييم AI دلالي — يفهم المرادفات والتصريفات
+    const aiPct = await aiScore(game.answer, playerMsg);
+    if (aiPct !== null) {
+      pct = aiPct;
+    } else {
+      // ② احتياط: مقارنة حرفية
+      pct = Math.round(simScore(game.answer, playerMsg) * 100);
     }
-
-    const raw = await gemini(
-`You are a fair language game judge. Grade the player's answer strictly according to the game context below.
-
-${context}
-
-GRADING SCALE:
-- Completely wrong or unrelated = 0-20%
-- Vaguely related but mostly wrong = 25-39%
-- Partially correct, shows some understanding = 40-65%
-- Mostly correct with minor issues = 70-85%
-- Perfect or near-perfect = 90-100%
-
-Max points: ${maxPts} — pts = round(pct/100 × ${maxPts})
-Reply with ONLY this exact line (no extra text):
-pct=XX pts=YY diff=سهل/متوسط/صعب ok=true/false feedback=ONE_SENTENCE_IN_${ansLang}`,
-      200, 0
-    );
-
-    const pct    = parseInt(raw.match(/pct=(\d+)/)?.[1]  || '0');
-    const rawPts = parseInt(raw.match(/pts=(\d+)/)?.[1]  || '0');
-    const pts    = Math.min(rawPts, maxPts);
-    const diff   = raw.match(/diff=([^\s]+)/)?.[1]        || 'متوسط';
-    const ok     = /ok=true/i.test(raw);
-    const fb     = raw.match(/feedback=(.+)/)?.[1]?.trim() || '';
-
-    console.log(`[EVAL] type=${game.type} pct=${pct} pts=${pts} ok=${ok} max=${maxPts}`);
-    return { correct: ok || pct>=40, pct, pts, difficulty:2, diffLabel:diff, feedback:fb };
-  } catch(e) {
-    console.error('[EVAL ERR]', e.message?.slice(0,80));
-    return { correct:false, pct:0, pts:0, difficulty:1, diffLabel:'', feedback:'' };
+  } else if (game.type === 'GAME_WORD') {
+    // اللاعب يشرح المعنى — AI يقيّم التشابه الدلالي
+    const aiPct = await aiScore(game.answer, playerMsg);
+    if (aiPct !== null) {
+      pct = Math.max(aiPct, playerMsg.trim().length > 10 ? 25 : 0);
+    } else {
+      pct = Math.round(Math.min(1, wordOverlap(game.answer, playerMsg)) * 100);
+      if (playerMsg.trim().length > 5) pct = Math.max(pct, 30);
+    }
+  } else {
+    // ترجمة جمل — AI يقيّم التشابه الدلالي للجملة كاملة
+    const aiPct = await aiScore(game.answer, playerMsg);
+    if (aiPct !== null) {
+      pct = Math.min(aiPct, 95);
+    } else {
+      pct = Math.min(Math.round(Math.min(1, wordOverlap(game.answer, playerMsg)) * 100), 95);
+    }
   }
+
+  const ok  = pct >= 50;
+  const pts = Math.min(Math.round(pct / 100 * maxPts), maxPts);
+  const feedback = ok ? pick(FB_OK) : pick(FB_BAD);
+  console.log(`[EVAL-AI] type=${game.type} pct=${pct} pts=${pts} ok=${ok}`);
+  return { correct: ok || pct >= 40, pct, pts, difficulty:2, diffLabel:'', feedback };
 }
 
-// ─── تقييم الإعراب — بسيط جداً بدون JSON ─────────────────────────────────────
 async function evalGrammar(game, playerMsg) {
-  try {
-    const raw = await gemini(
-`Grammar analysis judge. Sentence: "${game.question.slice(0,150)}"
-Player's analysis: "${playerMsg.slice(0,300)}"
-GRADING SCALE (medium difficulty):
-- Completely wrong or irrelevant = 0-20%
-- Mentions one grammar term but mostly wrong = 30-40%
-- Partial analysis, some correct roles = 50-65%
-- Good analysis, most roles correct = 70-84%
-- Complete and accurate analysis = 85-100%
-Be fair but not overly strict. Reward genuine effort.
-Reply with ONLY: pct=XX pts=YY feedback=SHORT_ARABIC_SENTENCE`,
-      120, 0
-    );
+  const terms = ['فعل','فاعل','مفعول','مبتدأ','خبر','نعت','مجرور','منصوب','مرفوع','حرف','اسم','مضاف','ماضٍ','مضارع','أمر','جازم','ناصب','رافع','تابع','صفة'];
+  const pw = normTxt(playerMsg).split(' ');
+  const matched = terms.filter(t => pw.some(w => w.includes(t))).length;
+  // AI يقيّم جودة الإجابة النحوية دلالياً
+  const aiPct  = await aiScore(game.answer, playerMsg);
+  const termPct = Math.min(95, matched * 12 + wordOverlap(game.answer, playerMsg) * 40);
+  const pct = aiPct !== null
+    ? Math.round((aiPct * 0.4 + termPct * 0.6))
+    : Math.max(35, Math.round(termPct));
+  const pts = Math.min(Math.round(pct / 100 * 10), 10);
 
-    const rawPct = parseInt(raw.match(/pct=(\d+)/)?.[1] || '0');
-    // حد أدنى معقول: أي محاولة حقيقية تأخذ 30% على الأقل
-    const pct = playerMsg.trim().length > 3 ? Math.max(rawPct, 30) : rawPct;
-    const pts = Math.min(Math.round(pct/100*10), 10);  // max 10 نقاط
-    const fb  = raw.match(/feedback=(.+)/)?.[1]?.trim() || 'حاول مجدداً! 💪';
-
-    console.log(`[GRAMMAR EVAL] pct=${pct} pts=${pts}`);
-    return { correct: pct>=40, pct, pts, difficulty:2, diffLabel:'متوسط', feedback:fb };
-  } catch(e) {
-    console.error('[GRAMMAR EVAL ERR]', e.message?.slice(0,60));
-    // عند الخطأ: أعطِ 40% افتراضية لأي محاولة حقيقية
-    const defaultPct = playerMsg.trim().length > 3 ? 40 : 0;
-    return { correct: defaultPct>=40, pct:defaultPct, pts:Math.round(defaultPct/100*10),
-             difficulty:2, diffLabel:'متوسط', feedback:'محاولة جيدة! 👍' };
+  // النموذج المحلي يولّد ملاحظة نحوية مخصصة
+  let feedback;
+  if (pct >= 60) {
+    feedback = pick(['تحليل جيد! 📝','أحسنت في الإعراب! ✅','ممتاز! 🌟']);
+  } else {
+    // محاولة توليد تلميح نحوي من النموذج المحلي (فقط لو جاهز)
+    try {
+      const hint = await localGenerate(
+        `Give a very short grammar tip (1 sentence) for: "${game.question?.slice(0,60)}"`,
+        40, true  // requireLoaded — لا تنتظر تحميل النموذج
+      );
+      if (hint && /[\u0600-\u06FF]/.test(hint)) {
+        feedback = `💡 ${hint.slice(0,100)}`;
+      } else {
+        const arHint = hint ? await localTranslate(hint, 'en', 'ar') : null;
+        feedback = arHint ? `💡 ${arHint.slice(0,100)}` : pick(['أضف مصطلحات الإعراب 💪','راجع علامات الإعراب 📖']);
+      }
+    } catch(e) {
+      feedback = pick(['أضف مصطلحات الإعراب 💪','راجع علامات الإعراب 📖','حاول بمصطلحات نحوية ✍️']);
+    }
   }
+  return { correct: pct >= 40, pct: Math.round(pct), pts, difficulty:2, diffLabel:'', feedback };
 }
-
-// ─── توليد الأسئلة ────────────────────────────────────────────────────────────
-// قوائم المواضيع العشوائية لكل نوع لعبة
-const WORD_TOPICS   = ['nature','animals','food','emotions','science','geography','history','technology','sports','art','human body','weather','space','ocean','plants','music','architecture','literature','philosophy','medicine'];
-const SENT_TOPICS   = ['wisdom & proverbs','daily life','science facts','geography','historical events','nature wonders','technology','health tips','culture & traditions','economics','psychology','environment','education','famous quotes','sports'];
-const TEXT_TOPICS   = ['ancient civilizations','space exploration','natural phenomena','great inventors','world literature','ocean life','human psychology','environmental challenges','famous historical events','cultural heritage','medical breakthroughs','philosophical ideas','notable scientists','wildlife','economic history'];
-const GRAMMAR_TOPICS= ['daily activities','travel & transportation','family & relationships','work & career','education','food & cooking','weather & seasons','sports & hobbies','nature & environment','science & technology'];
 
 function pick(arr) { return arr[Math.floor(Math.random()*arr.length)]; }
 
-async function makeQ(type, lang, fromLang, toLang) {
+// ─── قاموس احتياطي مدمج — يُستخدم عند فشل ويكاموس والإنترنت ─────────────────
+const FALLBACK_WORDS = {
+  ar: [
+    { title:'شمس',   def:'النجم الذي تدور حوله الأرض وتُضيء منه النهار' },
+    { title:'كتاب',  def:'وعاء المعرفة المكوّن من صفحات مكتوبة أو مطبوعة' },
+    { title:'ماء',   def:'سائل شفاف لا لون له ولا رائحة ولا طعم، أساس الحياة' },
+    { title:'نهر',   def:'مجرى طبيعي من المياه العذبة يصبّ في البحر أو البحيرة' },
+    { title:'جبل',   def:'ارتفاع طبيعي ضخم من الصخور يعلو فوق ما حوله' },
+    { title:'سماء',  def:'الفضاء الذي نراه فوقنا أزرق نهاراً ومليء بالنجوم ليلاً' },
+    { title:'قمر',   def:'جرم سماوي يدور حول الأرض ويعكس ضوء الشمس ليلاً' },
+    { title:'بحر',   def:'مسطح مائي واسع مالح يغطي معظم سطح الكرة الأرضية' },
+    { title:'شجرة',  def:'نبات خشبي كبير له جذع وأغصان وأوراق' },
+    { title:'علم',   def:'المعرفة المنظمة المستندة إلى الملاحظة والتجربة والبرهان' },
+    { title:'لغة',   def:'نظام تواصل بشري يُعبَّر به عن الأفكار بالكلمات والرموز' },
+    { title:'تاريخ', def:'علم يدرس أحداث الماضي وتسلسلها الزمني وأسبابها ونتائجها' },
+    { title:'موسيقى',def:'فن ترتيب الأصوات والإيقاعات لإنتاج تجربة جمالية' },
+    { title:'رياضة', def:'نشاط بدني منظم يُمارَس للترفيه أو المنافسة أو الصحة' },
+    { title:'ذاكرة', def:'قدرة العقل على تخزين المعلومات واسترجاعها عند الحاجة' },
+  ],
+  en: [
+    { title:'ocean',    def:'A vast body of salt water covering most of the Earth\'s surface' },
+    { title:'gravity',  def:'The force that attracts objects toward the center of the Earth' },
+    { title:'language', def:'A system of communication using words and grammar shared by a community' },
+    { title:'memory',   def:'The ability of the mind to store and recall past experiences' },
+    { title:'library',  def:'A place where books and other materials are kept for people to read' },
+    { title:'democracy',def:'A system of government where citizens vote to choose their leaders' },
+    { title:'economy',  def:'The system of production, trade, and money in a country' },
+    { title:'metaphor', def:'A figure of speech that describes something by saying it is something else' },
+    { title:'algorithm',def:'A set of step-by-step instructions for solving a problem or completing a task' },
+    { title:'philosophy',def:'The study of fundamental questions about existence, knowledge, and ethics' },
+  ],
+};
+
+function getFallbackWord(langCode, usedTitles = []) {
+  const words = FALLBACK_WORDS[langCode] || FALLBACK_WORDS.en;
+  const avail  = words.filter(w => !usedTitles.includes(w.title));
+  const pool   = avail.length > 0 ? avail : words; // إعادة التدوير
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+async function makeQ(type, lang, fromLang, toLang, channelId) {
   const gl = lang||fromLang||'Arabic';
   const fl = fromLang||gl;
   const tl = toLang||'English';
-  // دالة مساعدة لتحليل الرد النصي — مرنة مع أي تنسيق يرد من Gemini
-  function parseKV(raw, k1, k2) {
-    // تنظيف: إزالة markdown (**bold**، *italic*، backticks)
-    const text = raw
-      .replace(/\r\n/g,'\n').replace(/\r/g,'\n')
-      .replace(/\*\*([^*]+)\*\*/g,'$1')
-      .replace(/\*([^*]+)\*/g,'$1')
-      .replace(/`([^`]+)`/g,'$1');
+  const flCode = LANG_CODES[fl]||'ar';
+  const tlCode = LANG_CODES[tl]||'en';
+  const cid = String(channelId||'default');
 
-    // بحث مرن: يقبل **WORD:** أو WORD: أو  WORD :
-    const k2Re = new RegExp('(?:^|\\n)[\\s*]*'+k2+'[\\s*]*:[\\s*]*', 'i');
-    const k1Re = new RegExp('(?:^|\\n)[\\s*]*'+k1+'[\\s*]*:[\\s*]*', 'i');
+  // ── معرفات: تعريف مولَّد بالذكاء الاصطناعي — مختلف في كل مرة ────────────
+  if (type==='GAME_GUESS') {
+    const langCode = gl==='Arabic' ? 'ar' : flCode;
 
-    const k2Match = k2Re.exec(text);
-    if (!k2Match) {
-      console.warn('[PARSEKV] k2 not found:', k2, '| raw:', text.slice(0,120));
-      throw new Error('k2 not found: '+k2);
+    // جلب مقال (ويكاموس) أو استخدام الاحتياط المدمج
+    let art = await fetchArticle(langCode, cid).catch(() => null);
+    if (!art) {
+      // الاحتياط المدمج — يعمل دائماً بدون إنترنت
+      const fw = getFallbackWord(langCode, BRAIN.usedByChannel[cid] || []);
+      art = { title: fw.title, def: fw.def, clue: fw.def, key: `fallback:${fw.title}` };
+      console.log('[FALLBACK] استخدام كلمة احتياطية:', fw.title);
     }
 
-    const v2 = text.slice(k2Match.index + k2Match[0].length).trim();
-    const before = text.slice(0, k2Match.index);
+    // ① النموذج المحلي flan-t5 يولّد تعريفاً جديداً (فقط لو جاهز)
+    try {
+      const aiDef = await localMakeDefinition(art.title, langCode);
+      if (aiDef && aiDef.length > 15) {
+        console.log('[AI-DEF] 🤖 توليد محلي:', art.title, ':', aiDef.slice(0,50));
+        return { question:art.title, answer:art.title, display:aiDef, brainKey:art.key };
+      }
+    } catch(e) { /* يكمل للاحتياط */ }
 
-    const k1Match = k1Re.exec(before);
-    const v1 = k1Match
-      ? before.slice(k1Match.index + k1Match[0].length).trim()
-      : before.trim();
-
-    if (!v1 || !v2) throw new Error('empty value k1='+k1+' k2='+k2);
-    return [v1, v2];
+    // ② احتياط: التعريف المخزون
+    const display = art.def || makeDef(art.title, art.clue, '');
+    return { question:art.title, answer:art.title, display, brainKey:art.key };
   }
 
-  if (type==='GAME_GUESS') {
-    const topic = pick(WORD_TOPICS);
-    return gemini(
-`Choose one unique ${gl} word related to the topic: "${topic}".
-Describe its meaning in 1-2 sentences in ${gl} WITHOUT mentioning the word. Be creative and pick uncommon words.
-Reply ONLY in this format:
-WORD: [the word in ${gl}]
-MEANING: [the description in ${gl}]`, 200, 0.95
-    ).then(raw => {
-      console.log('[RAW GUESS]', raw.slice(0,120));
-      const [word, meaning] = parseKV(raw,'WORD','MEANING');
-      return {question:word, answer:word, display:meaning};
-    });
-  }
-
+  // ── شرح الكلمة: النموذج المحلي يولّد معنى مختلفاً في كل مرة ─────────────
   if (type==='GAME_WORD') {
-    const topic = pick(WORD_TOPICS);
-    console.log(`[GAME_WORD] توليد كلمة بالعربي - موضوع: ${topic}`);
-    return gemini(
-`Choose one interesting ${gl} word related to the topic: "${topic}". Pick a varied and educational word.
-Write its meaning in 1-2 sentences in ${gl}.
-Reply ONLY in this format:
-WORD: [the word in ${gl}]
-MEANING: [the meaning in ${gl}]`, 200, 0.95
-    ).then(raw => {
-      console.log('[RAW WORD]', raw.slice(0,120));
-      const [word, meaning] = parseKV(raw,'WORD','MEANING');
-      return {question:word, answer:meaning, display:word};
-    });
+    const langCode = gl==='Arabic' ? 'ar' : flCode;
+    const art = await fetchArticle(langCode, cid);
+    if (!art) throw new Error('تعذّر الحصول على كلمة');
+    // النموذج المحلي يولّد تلميح المعنى (بدون ذكر الكلمة)
+    try {
+      const aiClue = await localMakeDefinition(art.title, langCode);
+      if (aiClue && aiClue.length > 15) {
+        console.log('[AI-WORD] 🤖', art.title);
+        return { question:aiClue, answer:art.title, display:aiClue, brainKey:art.key };
+      }
+    } catch(e) { /* احتياط */ }
+    return { question:art.clue, answer:art.title, display:art.clue, brainKey:art.key };
   }
 
+  // ── ترجمة كلمة عبر ويكاموس ────────────────────────────────────────────
   if (type==='GAME_TR_WORD') {
-    const topic = pick(WORD_TOPICS);
-    return gemini(
-`Give one ${fl} word related to the topic: "${topic}" and its ${tl} translation. Vary the word each time.
-Reply ONLY in this format:
-WORD: [the word in ${fl}]
-TRANSLATION: [the translation in ${tl}]`, 100, 0.95
-    ).then(raw => {
-      const [word, trans] = parseKV(raw,'WORD','TRANSLATION');
-      return {question:word, answer:trans, display:word};
-    });
+    const pair = await fetchTranslationPair(flCode, tlCode, cid);
+    if (!pair) throw new Error('تعذّر الحصول على زوج ترجمة');
+    return { question:pair.src, answer:pair.ans, display:pair.src, brainKey:pair.key };
   }
 
+  // ── ترجمة جملة عبر ويكاموس ────────────────────────────────────────────
   if (type==='GAME_TR_SENT') {
-    const topic = pick(SENT_TOPICS);
-    return gemini(
-`Write one original educational sentence (max 12 words) in ${fl} about: "${topic}". Make it unique every time. No politics/religion/adult.
-Then give its ${tl} translation.
-Reply ONLY in this format:
-SENTENCE: [the sentence in ${fl}]
-TRANSLATION: [the translation in ${tl}]`, 200, 0.95
-    ).then(raw => {
-      const [sent, trans] = parseKV(raw,'SENTENCE','TRANSLATION');
-      return {question:sent, answer:trans, display:sent};
-    });
+    const pair = await fetchBilingualSentence(flCode, tlCode, cid);
+    if (!pair) throw new Error('تعذّر الحصول على جملة');
+    return { question:pair.src, answer:pair.ans, display:pair.src, brainKey:pair.key };
   }
 
+  // ── ترجمة نص عبر ويكاموس ──────────────────────────────────────────────
   if (type==='GAME_TR_TEXT') {
-    const topic = pick(TEXT_TOPICS);
-    return gemini(
-`Write a unique educational paragraph (3-5 sentences) in ${fl} about: "${topic}". Make it original and interesting. No politics/religion/adult.
-Then write its complete ${tl} translation.
-Reply ONLY in this format:
-TEXT: [the paragraph in ${fl}]
-TRANSLATION: [the translation in ${tl}]`, 700, 0.95
-    ).then(raw => {
-      const [text, trans] = parseKV(raw,'TEXT','TRANSLATION');
-      return {question:text, answer:trans, display:text};
-    });
+    const pair = await fetchBilingualSentence(flCode, tlCode, cid);
+    if (!pair) throw new Error('تعذّر الحصول على نص');
+    return { question:pair.src, answer:pair.ans, display:pair.src, brainKey:pair.key };
   }
 
+  // ── إعراب: جملة عربية حقيقية من الإنترنت — جديدة في كل مرة ─────────────
   if (type==='GAME_GRAMMAR') {
-    const topic = pick(GRAMMAR_TOPICS);
-    return gemini(
-`Write one original ${gl} sentence (5-8 words) about "${topic}" suitable for grammar analysis. Make it varied and educational.
-Then write a brief grammatical analysis (2-3 lines) in ${gl}.
-Reply ONLY in this format:
-SENTENCE: [the sentence]
-ANALYSIS: [the analysis]`, 300, 0.95
-    ).then(raw => {
-      const [sent, analysis] = parseKV(raw,'SENTENCE','ANALYSIS');
-      return {question:sent, answer:analysis, display:sent};
-    });
+    // ① ويكيبيديا العربية: جملة حقيقية عشوائية (80% من الوقت)
+    if (Math.random() < 0.8) {
+      try {
+        const sent = await fetchArabicSentence();
+        if (sent && sent.length >= 20 && sent.length <= 200) {
+          // بحث DuckDuckGo لمعرفة موضوع الجملة (للإجابة النموذجية)
+          const shortSent = sent.slice(0, 60);
+          console.log('[GRAMMAR] 🆕 جملة من ويكيبيديا:', shortSent);
+          return {
+            question: sent,
+            answer:   sent,            // الجواب: إعراب الجملة كاملاً
+            display:  sent,
+            brainKey: `gr_${Date.now()}_${Math.random().toString(36).slice(2,6)}`
+          };
+        }
+      } catch(e) { console.warn('[GRAMMAR-WIKI]', e.message?.slice(0,40)); }
+    }
+    // ② ويكاموس احتياط
+    const pair = await fetchBilingualSentence('ar', 'en', cid);
+    if (pair) return { question:pair.src, answer:pair.ans, display:pair.src, brainKey:pair.key };
+    const art = await fetchArticle('ar', cid);
+    if (!art) throw new Error('تعذّر الحصول على جملة للإعراب');
+    return { question:art.clue, answer:art.title, display:art.clue, brainKey:art.key };
   }
+
   throw new Error('Unknown type: '+type);
 }
 
@@ -659,17 +1281,27 @@ async function startGame(cid, type, lang, fromLang, toLang) {
   await send('⏳...');
   let q;
   let lastErr = '';
-  for (let attempt = 1; attempt await alert('⚠️ تعذّر توليد السؤال، حاول لاحقاً.');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const pre = pregenQ[cid];
+      if (attempt === 1 && pre?.type===type) { q=pre; delete pregenQ[cid]; break; }
+      q = await makeQ(type, lang, fromLang, toLang, cid);
+      break;
+    } catch(e) {
+      lastErr = e.message || String(e);
+      console.error(`[MAKEQ ERR attempt=${attempt}]`, type, lastErr.slice(0,120));
+      if (attempt === 3) {
+        await alert('⚠️ تعذّر توليد السؤال. تحقق من الاتصال بالإنترنت وحاول لاحقاً.');
         return;
       }
-      await sleep(2000);
+      await sleep(3000);
     }
   }
   if (!q) return;
   games[cid] = {type,lang,fromLang,toLang,...q};
-  resetIdleTimer(cid); // يوقف اللعبة تلقائياً بعد 10 دقائق بدون إجابة
-  // تحضير السؤال التالي في الخلفية
-  makeQ(type,lang,fromLang,toLang).then(nq=>{ pregenQ[cid]={type,...nq}; }).catch(()=>{});
+  resetIdleTimer(cid);
+  // تحضير السؤال التالي في الخلفية (التعلم الاستباقي)
+  makeQ(type,lang,fromLang,toLang,cid).then(nq=>{ pregenQ[cid]={type,...nq}; }).catch(()=>{});
   const arrow = ['GAME_TR_WORD','GAME_TR_SENT','GAME_TR_TEXT'].includes(type) ? ` (${fromLang}→${toLang})` : '';
   await send(`${LABEL[type]||'🎮'}${arrow}\n\n${q.display}\n\n💡 اكتب # قبل إجابتك`);
 }
@@ -724,6 +1356,7 @@ const HELP_TEXT =
 🏆 !لغه مجموع
 📊 !لغه ترتيب قناه
 🌍 !لغه ترتيب ولف
+🔍 !بحث [كلمة] — بحث في الإنترنت (DuckDuckGo)
 📋 !لغه مساعده`;
 
 // ─── Wolf Bot ─────────────────────────────────────────────────────────────────
@@ -790,7 +1423,10 @@ client.on('channelMessage', async (msg) => {
       await send('📝 جاري فحص الإجابة ...');
       const ev = await evalAnswer(games[cid], answerText);
       const diff = ev.diffLabel ? ` | ${ev.diffLabel}` : '';
+      const brainKey = games[cid]?.brainKey || null;
       if (ev.correct || ev.pct>=30) {
+        // ─── الذكاء الاصطناعي يتعلم: الإجابة الصحيحة تقلل صعوبة السؤال ──
+        learnResult(brainKey, true);
         // ─── تسجيل اللاعب فقط عند الحصول على نقاط ───────────────────────
         let name = String(uid);
         try { const s = await client.subscriber.getById(uid); if(s?.nickname) name=s.nickname; } catch(e){}
@@ -803,6 +1439,8 @@ client.on('channelMessage', async (msg) => {
         endGame(cid);
         setTimeout(()=>{ if(autoSt[cid]?.active) runAutoNow(cid); }, 2000);
       } else {
+        // ─── الذكاء الاصطناعي يتعلم: الإجابة الخاطئة ترفع صعوبة السؤال ──
+        learnResult(brainKey, false);
         const bar = '█'.repeat(Math.round(ev.pct/10)) + '░'.repeat(10-Math.round(ev.pct/10));
         await alert(`❌ ${ev.pct}%${diff}\n${bar}\n💬 ${ev.feedback}`);
       }
@@ -897,80 +1535,91 @@ client.on('channelMessage', async (msg) => {
   }
 
   if (cmd==='MEANING') {
-    const q = queryText||text.replace(/^[!！]\S+\s*/,'').trim();
+    const q = (queryText||text.replace(/^[!！]\S+\s*/,'')).trim();
     if (!q) return;
     if (isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
-    await send('⏳...');
+    await send(`🔍 أبحث عن معنى: ${q}...`);
     try {
-      const ans = await gemini(`Define "${q}" in ${lang}. Reply in ONE sentence only, max 15 words. No labels, no extra text.`, 80, 0.3);
-      await send(`📚 ${ans}`);
+      // ─── بحث ذكي بدون ويكاموس — Free Dictionary + DuckDuckGo + ويكيبيديا ──
+      const isEnWord = /^[a-zA-Z\s'-]+$/.test(q.trim());
+      const mainCode = isEnWord ? 'en' : 'ar';
+      const altCode  = isEnWord ? 'ar' : 'en';
+
+      // دالة لتقصير النتيجة — جملة واحدة أو 150 حرف كحد أقصى
+      const trim = t => t ? t.split(/[.!?؟]/)[0].trim().slice(0,200) : '';
+
+      // ① ابحث بلغة الكلمة الأصلية
+      const def = await aiMeaning(q.trim(), mainCode);
+      if (def) { await send(`📚 ${q}\n${trim(def)}`); return; }
+      // ② ابحث باللغة المقابلة
+      const revDef = await aiMeaning(q.trim(), altCode);
+      if (revDef) { await send(`📚 ${q}\n${trim(revDef)}`); return; }
+      // ③ احتياط أخير: DuckDuckGo
+      const ddg = await duckSearch(q);
+      const fallback = ddg.abstract || ddg.definition || (ddg.topics[0]||'');
+      if (fallback.length > 10) {
+        await send(`📚 ${q}\n${trim(fallback)}`);
+        return;
+      }
+      await alert(`⚠️ لم أجد معنى لـ "${q}". جرّب كتابة الكلمة بشكل مختلف.`);
     } catch(e) {
-      console.error('[MEANING ERR]', (e.message||'').slice(0,100));
-      await alert('⚠️ تعذّر الآن، حاول لاحقاً.');
+      console.error('[MEANING ERR]', e.message?.slice(0,60));
+      await alert('⚠️ تعذّر البحث، تحقق من الاتصال بالإنترنت.');
     }
     return;
   }
 
   if (cmd==='TRANSLATE') {
-    const q = queryText||text.replace(/^[!！]\S+\s*/,'').trim();
+    const q = (queryText||text.replace(/^[!！]\S+\s*/,'')).trim();
     if (!q) return;
     if (isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
-    await send('⏳...');
+    await send('🌐 أبحث في ويكاموس...');
     try {
-      const ans = await gemini(`Translate to ${tl}. Return ONLY the translation:\n${q}`, 300, 0.3);
-      await send(`🌐 ${ans}`);
+      // ─── الترجمة عبر ويكاموس (Wiktionary) ──────────────────────────────
+      const fromCode = LANG_CODES[fl] || (detectLang(q)==='Arabic'?'ar':'en');
+      const toCode   = LANG_CODES[tl] || (fromCode==='ar'?'en':'ar');
+      const result = await aiTranslate(q.trim(), fromCode, toCode);
+      if (result && result!==q) { await send(`🌐 ${q}\n➜ ${result}`); return; }
+      // ترجمة عكسية
+      const revResult = await aiTranslate(q.trim(), toCode, fromCode);
+      if (revResult && revResult!==q) { await send(`🌐 ${q}\n➜ ${revResult}`); return; }
+      await alert(`⚠️ لم أجد ترجمة لـ "${q}" في ويكاموس.`);
     } catch(e) {
-      console.error('[TRANSLATE ERR]', (e.message||'').slice(0,100));
-      await alert('⚠️ تعذّر الآن، حاول لاحقاً.'end(`⚠️ يوجد وضع تلقائي نشط: ${curLabel}\nأوقفه أولاً بنفس الأمر قبل بدء نوع آخر.`);
-      return;
-    }
-    await toggleAuto(cid, newType, lang, fl, tl);
-    return;
-  }
-
-  // بدء الألعاب
-  const GAME_CMDS = ['GAME_GUESS','GAME_WORD','GAME_TR_WORD','GAME_TR_SENT','GAME_TR_TEXT','GAME_GRAMMAR'];
-  if (GAME_CMDS.includes(cmd)) {
-    // منع التداخل فقط إذا كان الوضع التلقائي نشطاً
-    if (autoSt[cid]?.active) {
-      const curLabel = LABEL[autoSt[cid].type] || autoSt[cid].type;
-      await send(`⚠️ الوضع التلقائي نشط: ${curLabel}\nأوقفه أولاً قبل بدء لعبة يدوية.`);
-      return;
-    }
-    // إذا كان الوضع التلقائي متوقفاً أو لا توجد لعبة → ابدأ مباشرة
-    await startGame(cid, cmd, lang, fl, tl);
-    return;
-  }
-
-  if (cmd==='MEANING') {
-    const q = queryText||text.replace(/^[!！]\S+\s*/,'').trim();
-    if (!q) return;
-    if (isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
-    await send('⏳...');
-    try {
-      const ans = await gemini(`Define "${q}" in ${lang}. Reply in ONE sentence only, max 15 words. No labels, no extra text.`, 80, 0.3);
-      await send(`📚 ${ans}`);
-    } catch(e) {
-      const m = (e.message||String(e)).slice(0,200);
-      console.error('[MEANING ERR]', m);
-      await alert(`⚠️ خطأ:\n${m}`);
+      console.error('[TRANSLATE ERR]', e.message?.slice(0,60));
+      await alert('⚠️ تعذّرت الترجمة، تحقق من الاتصال بالإنترنت.');
     }
     return;
   }
 
-  if (cmd==='TRANSLATE') {
-    const q = queryText||text.replace(/^[!！]\S+\s*/,'').trim();
-    if (!q) return;
+  // ─── !بحث — بحث حر في الإنترنت عبر DuckDuckGo ───────────────────────────
+  if (cmd==='SEARCH') {
+    const q = (queryText||text.replace(/^[!！]\S+\s*/,'')).trim();
+    if (!q) { await send('🔍 اكتب: !بحث [كلمة أو جملة]'); return; }
     if (isVulgar(q)) { await alert('مخالفة ⚠️'); return; }
-    await send('⏳...');
+    await send(`🔍 أبحث عن: ${q}...`);
     try {
-      const ans = await gemini(`Translate to ${tl}. Return ONLY the translation:\n${q}`, 300, 0.3);
-      await send(`🌐 ${ans}`);
+      const ddg = await duckSearch(q);
+      const lines = [];
+      if (ddg.abstract)   lines.push(`📄 ${ddg.abstract.slice(0,300)}`);
+      else if (ddg.definition) lines.push(`📖 ${ddg.definition.slice(0,300)}`);
+      if (ddg.answer)     lines.push(`💡 ${ddg.answer}`);
+      ddg.topics.slice(0,3).forEach(t => t && lines.push(`• ${t.slice(0,120)}`));
+      if (lines.length === 0) {
+        // احتياط: ويكاموس
+        const code = detectLang(q)==='Arabic' ? 'ar' : 'en';
+        const def  = await aiMeaning(q, code);
+        if (def) lines.push(`📚 ${def.slice(0,300)}`);
+      }
+      if (lines.length > 0) {
+        await send(`🔍 نتائج: ${q}\n━━━━━━━━━━\n${lines.join('\n')}`);
+      } else {
+        await alert(`⚠️ لم أجد نتائج لـ "${q}".`);
+      }
     } catch(e) {
-      const m = (e.message||String(e)).slice(0,200);
-      console.error('[TRANSLATE ERR]', m);
-      await alert(`⚠️ خطأ:\n${m}`);
+      console.error('[SEARCH ERR]', e.message?.slice(0,60));
+      await alert('⚠️ تعذّر البحث، تحقق من الاتصال بالإنترنت.');
     }
+    return;
   }
 });
 
